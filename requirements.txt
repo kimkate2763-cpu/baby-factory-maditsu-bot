@@ -1,0 +1,6 @@
+
+Flask
+gunicorn
+psycopg[binary]
+line-bot-sdk
+  
