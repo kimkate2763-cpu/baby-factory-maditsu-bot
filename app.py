@@ -1,407 +1,409 @@
-
 import os
-import re
+import hmac
+import hashlib
+import base64
 import logging
-from datetime import datetime, date, timedelta
+import re
+
+from datetime import datetime
 from zoneinfo import ZoneInfo
-from threading import Lock
 
+import requests
 import psycopg
-from flask import Flask, request, abort, jsonify
-from linebot.v3 import WebhookHandler
-from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.messaging import (
-    Configuration,
-    ApiClient,
-    MessagingApi,
-    ReplyMessageRequest,
-    TextMessage,
-)
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
+from psycopg.rows import dict_row
+from flask import Flask, request, jsonify, abort
 
 
-# --------------------------------------------------
+# ==================================================
 # 기본 설정
-# --------------------------------------------------
+# ==================================================
 
 app = Flask(__name__)
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("baby-factory-maditsu")
+logger = logging.getLogger("baby-factory-maditsu-bot")
+
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "").strip()
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv(
+    "LINE_CHANNEL_ACCESS_TOKEN", ""
+).strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 KST = ZoneInfo("Asia/Seoul")
 
-CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
-CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
-if not CHANNEL_SECRET:
-    logger.warning("LINE_CHANNEL_SECRET 환경변수가 설정되지 않았습니다.")
-
-if not CHANNEL_ACCESS_TOKEN:
-    logger.warning("LINE_CHANNEL_ACCESS_TOKEN 환경변수가 설정되지 않았습니다.")
-
-if not DATABASE_URL:
-    logger.warning("DATABASE_URL 환경변수가 설정되지 않았습니다.")
-
-configuration = Configuration(
-    access_token=CHANNEL_ACCESS_TOKEN
-)
-
-handler = WebhookHandler(CHANNEL_SECRET)
-
-database_lock = Lock()
-profile_cache = {}
-profile_lock = Lock()
-
-
-# --------------------------------------------------
-# 데이터베이스
-# --------------------------------------------------
+# ==================================================
+# 데이터베이스 연결
+# ==================================================
 
 def get_db():
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL이 설정되지 않았습니다.")
+        raise RuntimeError(
+            "DATABASE_URL 환경변수가 설정되지 않았습니다."
+        )
 
-    return psycopg.connect(DATABASE_URL)
+    return psycopg.connect(
+        DATABASE_URL,
+        row_factory=dict_row,
+        connect_timeout=15,
+    )
 
+
+# ==================================================
+# 데이터베이스 테이블 자동 생성
+# ==================================================
 
 def init_database():
-    with database_lock:
-        with get_db() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS message_events (
-                    event_id TEXT PRIMARY KEY,
-                    chat_id TEXT NOT NULL,
-                    user_id TEXT NOT NULL,
-                    display_name TEXT NOT NULL,
-                    day_kst DATE NOT NULL,
-                    char_count INTEGER NOT NULL DEFAULT 0,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                )
-            """)
+    with get_db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS message_events (
+                event_id TEXT PRIMARY KEY,
+                group_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                display_name TEXT NOT NULL DEFAULT '이름 미확인',
+                message_date DATE NOT NULL,
+                character_count INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
 
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS
-                idx_message_events_chat_day
-                ON message_events (chat_id, day_kst)
-            """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_message_group_date
+            ON message_events (group_id, message_date)
+        """)
 
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS
-                idx_message_events_chat_user_day
-                ON message_events (chat_id, user_id, day_kst)
-            """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_message_group_user_date
+            ON message_events (group_id, user_id, message_date)
+        """)
 
     logger.info("데이터베이스 초기화 완료")
 
 
-# --------------------------------------------------
-# 사용자 이름 가져오기
-# --------------------------------------------------
-
-def get_display_name(chat_type, chat_id, user_id):
-    if not user_id:
-        return "알 수 없는 사용자"
-
-    cache_key = (chat_type, chat_id, user_id)
-
-    with profile_lock:
-        cached_name = profile_cache.get(cache_key)
-
-    if cached_name:
-        return cached_name
-
-    display_name = "사용자-" + user_id[-6:]
-
-    try:
-        with ApiClient(configuration) as api_client:
-            api = MessagingApi(api_client)
-
-            if chat_type == "group":
-                profile = api.get_group_member_profile(
-                    chat_id, user_id
-                )
-            elif chat_type == "room":
-                profile = api.get_room_member_profile(
-                    chat_id, user_id
-                )
-            else:
-                profile = api.get_profile(user_id)
-
-            if profile and profile.display_name:
-                display_name = profile.display_name
-
-    except Exception:
-        logger.exception("사용자 이름 조회 실패")
-
-    with profile_lock:
-        profile_cache[cache_key] = display_name
-
-    return display_name
+# 중요: Gunicorn으로 실행해도 테이블이 생성되도록
+# 파일을 불러오는 시점에 초기화를 실행합니다.
+init_database()
 
 
-# --------------------------------------------------
-# 메시지 기록
-# --------------------------------------------------
+# ==================================================
+# LINE 사용자 프로필 및 닉네임
+# ==================================================
 
-def record_message(event, chat_type, chat_id, user_id, text):
-    # 공백, 줄바꿈, 탭 등을 제외한 글자 수
-    char_count = len(re.sub(r"\s+", "", text))
+def get_display_name(source, group_id, user_id):
+    """LINE 프로필을 조회하고, 조회 실패 시 기본 이름을 사용합니다."""
 
-    # LINE 메시지의 발송 시각을 한국 시간으로 변환
-    if event.timestamp:
-        message_time = datetime.fromtimestamp(
-            event.timestamp / 1000,
-            tz=KST
+    fallback_name = "사용자-" + user_id[-6:]
+
+    if not LINE_CHANNEL_ACCESS_TOKEN:
+        return fallback_name
+
+    if source.get("type") == "group" and group_id:
+        url = (
+            "https://api.line.me/v2/bot/group/"
+            f"{group_id}/member/{user_id}"
+        )
+    elif source.get("type") == "room" and group_id:
+        url = (
+            "https://api.line.me/v2/bot/room/"
+            f"{group_id}/member/{user_id}"
         )
     else:
-        message_time = datetime.now(KST)
+        url = (
+            "https://api.line.me/v2/bot/profile/"
+            f"{user_id}"
+        )
 
-    message_day = message_time.date()
+    try:
+        response = requests.get(
+            url,
+            headers={
+                "Authorization": (
+                    f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"
+                )
+            },
+            timeout=8,
+        )
 
-    display_name = get_display_name(
-        chat_type, chat_id, user_id
-    )
+        if response.ok:
+            name = response.json().get("displayName")
+            if name:
+                return name
+
+        logger.warning(
+            "프로필 조회 실패: status=%s",
+            response.status_code,
+        )
+
+    except Exception:
+        logger.exception("LINE 프로필 조회 중 오류 발생")
+
+    return fallback_name
+
+
+# ==================================================
+# 메시지 기록
+# ==================================================
+
+def record_message(
+    event_id,
+    group_id,
+    user_id,
+    display_name,
+    message_date,
+    character_count,
+):
+    """같은 메시지가 중복으로 기록되지 않도록 저장합니다."""
 
     with get_db() as conn:
-        result = conn.execute(
+        conn.execute(
             """
             INSERT INTO message_events (
                 event_id,
-                chat_id,
+                group_id,
                 user_id,
                 display_name,
-                day_kst,
-                char_count,
-                created_at
+                message_date,
+                character_count
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s)
             ON CONFLICT (event_id) DO NOTHING
-            RETURNING event_id
             """,
             (
-                event.message.id,
-                chat_id,
+                event_id,
+                group_id,
                 user_id,
                 display_name,
-                message_day,
-                char_count,
-                message_time,
+                message_date,
+                character_count,
             ),
         )
 
-        inserted = result.fetchone() is not None
 
-    return inserted, message_day
+# ==================================================
+# LINE 답장
+# ==================================================
+
+def reply_text(reply_token, text):
+    if not reply_token:
+        return
+
+    if not LINE_CHANNEL_ACCESS_TOKEN:
+        logger.error("LINE 액세스 토큰이 설정되지 않았습니다.")
+        return
+
+    try:
+        response = requests.post(
+            "https://api.line.me/v2/bot/message/reply",
+            headers={
+                "Authorization": (
+                    f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"
+                ),
+                "Content-Type": "application/json",
+            },
+            json={
+                "replyToken": reply_token,
+                "messages": [
+                    {
+                        "type": "text",
+                        "text": str(text)[:4900],
+                    }
+                ],
+            },
+            timeout=10,
+        )
+
+        if not response.ok:
+            logger.error(
+                "LINE 답장 실패: status=%s body=%s",
+                response.status_code,
+                response.text[:1000],
+            )
+
+    except Exception:
+        logger.exception("LINE 답장 전송 중 오류 발생")
 
 
-# --------------------------------------------------
-# 순위 조회
-# --------------------------------------------------
+# ==================================================
+# 오늘의 개인 마딧수
+# ==================================================
 
-def get_ranking(chat_id, start_day, end_day):
+def get_my_stats(group_id, user_id, today):
     with get_db() as conn:
+        stats = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS message_count,
+                COALESCE(SUM(character_count), 0)
+                    AS character_count
+            FROM message_events
+            WHERE group_id = %s
+              AND user_id = %s
+              AND message_date = %s
+            """,
+            (group_id, user_id, today),
+        ).fetchone()
+
+        ranking = conn.execute(
+            """
+            WITH daily_counts AS (
+                SELECT
+                    user_id,
+                    COUNT(*) AS message_count
+                FROM message_events
+                WHERE group_id = %s
+                  AND message_date = %s
+                GROUP BY user_id
+            ),
+            ranked AS (
+                SELECT
+                    user_id,
+                    message_count,
+                    RANK() OVER (
+                        ORDER BY message_count DESC
+                    ) AS user_rank
+                FROM daily_counts
+            )
+            SELECT user_rank
+            FROM ranked
+            WHERE user_id = %s
+            """,
+            (group_id, today, user_id),
+        ).fetchone()
+
+    rank = ranking["user_rank"] if ranking else "-"
+
+    return (
+        f"오늘의 마딧수\n"
+        f"날짜: {today}\n"
+        f"내 마딧수: {stats['message_count']:,}마디\n"
+        f"공백 제외 글자 수: {stats['character_count']:,}자\n"
+        f"오늘의 순위: {rank}위"
+    )
+
+
+# ==================================================
+# 전체 마딧수 순위
+# ==================================================
+
+def get_ranking(group_id, start_date, end_date, title):
+    with get_db() as conn:
+        summary = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total_messages,
+                COUNT(DISTINCT user_id) AS participant_count
+            FROM message_events
+            WHERE group_id = %s
+              AND message_date >= %s
+              AND message_date <= %s
+            """,
+            (group_id, start_date, end_date),
+        ).fetchone()
+
         rows = conn.execute(
             """
             SELECT
                 user_id,
                 MAX(display_name) AS display_name,
-                COUNT(*) AS message_count,
-                COALESCE(SUM(char_count), 0) AS char_count
+                COUNT(*) AS message_count
             FROM message_events
-            WHERE chat_id = %s
-              AND day_kst >= %s
-              AND day_kst <= %s
+            WHERE group_id = %s
+              AND message_date >= %s
+              AND message_date <= %s
             GROUP BY user_id
-            ORDER BY message_count DESC,
-                     char_count DESC,
-                     display_name ASC
+            ORDER BY message_count DESC, display_name ASC
+            LIMIT 50
             """,
-            (chat_id, start_day, end_day),
+            (group_id, start_date, end_date),
         ).fetchall()
 
-    return rows
+    lines = [
+        f"마딧수 순위: {title}",
+        f"전체 메시지: {summary['total_messages']:,}개",
+        f"참여 인원: {summary['participant_count']:,}명",
+        "",
+    ]
 
-
-def format_ranking(rows, title, limit=30):
     if not rows:
-        return f"{title}\n아직 기록된 마딧수가 없어."
+        lines.append("아직 기록된 메시지가 없습니다.")
+        lines.append("봇이 들어온 뒤 기록된 메시지부터 집계됩니다.")
+        return "\n".join(lines)
 
-    lines = [title, ""]
+    lines.append("활동 순위")
 
-    for index, row in enumerate(rows[:limit], start=1):
-        _, name, message_count, char_count = row
-
+    for rank, row in enumerate(rows, start=1):
         lines.append(
-            f"{index}위. {name}\n"
-            f"마딧수: {message_count:,} | "
-            f"공백 제외 글자 수: {char_count:,}"
+            f"{rank}위. {row['display_name']} "
+            f"- {row['message_count']:,}마디"
         )
 
-    if len(rows) > limit:
-        lines.append("")
-        lines.append(
-            f"전체 {len(rows)}명 중 상위 {limit}명만 표시했어."
-        )
+    lines.extend([
+        "",
+        "※ 순위는 최대 50명까지 표시됩니다.",
+        "※ 동점자는 표시 순서에 따라 번호가 달라질 수 있습니다.",
+    ])
 
     return "\n".join(lines)
 
 
-def get_my_stats(chat_id, user_id, today):
-    rows = get_ranking(chat_id, today, today)
-
-    my_row = None
-    my_rank = None
-
-    for index, row in enumerate(rows, start=1):
-        if row[0] == user_id:
-            my_row = row
-            my_rank = index
-            break
-
-    if my_row is None:
-        return (
-            f"내 마딧수 ({today.isoformat()})\n\n"
-            "오늘 기록된 메시지가 없어.\n"
-            "그룹 채팅에서 메시지를 보내면 기록이 시작돼."
-        )
-
-    _, name, message_count, char_count = my_row
-
-    return (
-        f"내 마딧수 ({today.isoformat()})\n\n"
-        f"이름: {name}\n"
-        f"오늘 마딧수: {message_count:,}\n"
-        f"공백 제외 글자 수: {char_count:,}\n"
-        f"오늘 순위: {my_rank}위 / {len(rows)}명"
-    )
-
-
-# --------------------------------------------------
+# ==================================================
 # 명령어 처리
-# --------------------------------------------------
+# ==================================================
 
-DATE_RANGE_PATTERN = re.compile(
-    r"^\*(\d{4}-\d{2}-\d{2})"
-    r"\s*~\s*"
-    r"(\d{4}-\d{2}-\d{2})\s*마딧수$"
-)
+def handle_command(text, group_id, user_id, today):
+    if text == "내 마딧수":
+        return get_my_stats(group_id, user_id, today)
 
-
-def make_reply(text, chat_id, user_id):
-    today = datetime.now(KST).date()
-    command = text.strip()
-
-    if command == "내 마딧수":
-        return get_my_stats(chat_id, user_id, today)
-
-    if command == "*마딧수":
-        rows = get_ranking(chat_id, today, today)
-
-        return format_ranking(
-            rows,
-            f"오늘의 마딧수 순위 ({today.isoformat()})"
+    if text == "*마딧수":
+        return get_ranking(
+            group_id,
+            today,
+            today,
+            str(today),
         )
 
-    match = DATE_RANGE_PATTERN.fullmatch(command)
+    match = re.fullmatch(
+        r"\*(\d{4}-\d{2}-\d{2})\s*~\s*"
+        r"(\d{4}-\d{2}-\d{2})\s*마딧수",
+        text,
+    )
 
     if match:
         try:
-            start_day = date.fromisoformat(match.group(1))
-            end_day = date.fromisoformat(match.group(2))
+            start_date = datetime.strptime(
+                match.group(1), "%Y-%m-%d"
+            ).date()
+
+            end_date = datetime.strptime(
+                match.group(2), "%Y-%m-%d"
+            ).date()
+
         except ValueError:
             return (
-                "날짜를 올바르게 입력해 줘.\n"
-                "예: *2026-11-01~2026-11-02 마딧수"
+                "날짜 형식이 올바르지 않습니다.\n"
+                "예시: *2026-10-01~2026-10-31 마딧수"
             )
 
-        if start_day > end_day:
-            return "시작 날짜는 종료 날짜보다 늦을 수 없어."
+        if start_date > end_date:
+            return "시작 날짜가 종료 날짜보다 늦습니다."
 
-        if (end_day - start_day).days > 365:
-            return "한 번에 조회할 수 있는 기간은 최대 366일이야."
-
-        rows = get_ranking(chat_id, start_day, end_day)
-
-        return format_ranking(
-            rows,
-            f"기간별 마딧수 순위\n"
-            f"{start_day.isoformat()} ~ {end_day.isoformat()}"
+        return get_ranking(
+            group_id,
+            start_date,
+            end_date,
+            f"{start_date} ~ {end_date}",
         )
 
     return None
 
 
-# --------------------------------------------------
-# LINE 웹훅
-# --------------------------------------------------
-
-@handler.add(MessageEvent, message=TextMessageContent)
-def handle_text_message(event):
-    try:
-        source = event.source
-        text = event.message.text or ""
-
-        # 그룹 및 다인 채팅만 집계
-        if source.type == "group":
-            chat_type = "group"
-            chat_id = source.group_id
-
-        elif source.type == "room":
-            chat_type = "room"
-            chat_id = source.room_id
-
-        else:
-            # 개인 채팅은 집계하지 않음
-            return
-
-        user_id = source.user_id
-
-        if not user_id or not chat_id:
-            return
-
-        # 텍스트 메시지를 한 번 기록
-        inserted, _ = record_message(
-            event,
-            chat_type,
-            chat_id,
-            user_id,
-            text
-        )
-
-        # 중복 전달된 메시지는 재집계하거나 재응답하지 않음
-        if not inserted:
-            return
-
-        # 일반 대화에는 답변하지 않고 지정 명령어에만 응답
-        reply_text = make_reply(text, chat_id, user_id)
-
-        if not reply_text:
-            return
-
-        # LINE 메시지 길이 제한에 대비
-        reply_text = reply_text[:4500]
-
-        with ApiClient(configuration) as api_client:
-            api = MessagingApi(api_client)
-
-            api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[
-                        TextMessage(text=reply_text)
-                    ]
-                )
-            )
-
-    except Exception:
-        logger.exception("메시지 처리 중 오류 발생")
-
+# ==================================================
+# 상태 확인 주소
+# ==================================================
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Baby Factory Maditsu Bot is running!"
+    return "Baby Factory 마딧수 봇이 실행 중입니다."
 
 
 @app.route("/health", methods=["GET"])
@@ -412,47 +414,142 @@ def health():
 
         return jsonify({
             "status": "ok",
-            "database": "connected"
-        }), 200
+            "database": "connected",
+        })
 
     except Exception:
         logger.exception("헬스 체크 실패")
-
         return jsonify({
             "status": "error",
-            "database": "disconnected"
-        }), 503
+            "database": "disconnected",
+        }), 500
 
+
+# ==================================================
+# LINE 웹훅
+# ==================================================
 
 @app.route("/callback", methods=["POST"])
 def callback():
+    body = request.get_data()
     signature = request.headers.get("X-Line-Signature", "")
 
-    if not signature:
-        abort(400)
-
-    body = request.get_data(as_text=True)
-
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        logger.warning("LINE 웹훅 서명 검증 실패")
-        abort(400)
-    except Exception:
-        logger.exception("웹훅 처리 오류")
+    if not LINE_CHANNEL_SECRET:
+        logger.error("LINE_CHANNEL_SECRET이 설정되지 않았습니다.")
         abort(500)
 
-    return "OK", 200
+    digest = hmac.new(
+        LINE_CHANNEL_SECRET.encode("utf-8"),
+        body,
+        hashlib.sha256,
+    ).digest()
+
+    expected_signature = base64.b64encode(
+        digest
+    ).decode("utf-8")
+
+    if not hmac.compare_digest(
+        expected_signature, signature
+    ):
+        logger.warning("LINE 웹훅 서명 검증 실패")
+        abort(400)
+
+    try:
+        payload = request.get_json(force=True)
+        events = payload.get("events", [])
+
+        for event in events:
+            try:
+                process_event(event)
+            except Exception:
+                logger.exception("LINE 이벤트 처리 실패")
+
+        return "OK", 200
+
+    except Exception:
+        logger.exception("웹훅 처리 중 오류 발생")
+        return "ERROR", 500
 
 
-# --------------------------------------------------
-# 서버 시작
-# --------------------------------------------------
+# ==================================================
+# 개별 이벤트 처리
+# ==================================================
+
+def process_event(event):
+    if event.get("type") != "message":
+        return
+
+    message = event.get("message", {})
+
+    # 텍스트 메시지만 집계합니다.
+    if message.get("type") != "text":
+        return
+
+    source = event.get("source", {})
+    source_type = source.get("type")
+
+    # 그룹 또는 LINE 멀티인원 대화만 집계합니다.
+    if source_type == "group":
+        group_id = source.get("groupId")
+    elif source_type == "room":
+        group_id = source.get("roomId")
+    else:
+        return
+
+    user_id = source.get("userId")
+    message_id = message.get("id")
+    text = message.get("text", "")
+
+    if not group_id or not user_id or not message_id:
+        logger.warning("필수 이벤트 정보가 없어 건너뜁니다.")
+        return
+
+    now = datetime.now(KST)
+    today = now.date()
+
+    display_name = get_display_name(
+        source,
+        group_id,
+        user_id,
+    )
+
+    # 공백과 줄바꿈을 제외한 글자 수를 계산합니다.
+    character_count = len(
+        re.sub(r"\s+", "", text)
+    )
+
+    # 먼저 메시지를 저장합니다. 동일한 LINE 메시지는 중복 저장하지 않습니다.
+    record_message(
+        event_id=message_id,
+        group_id=group_id,
+        user_id=user_id,
+        display_name=display_name,
+        message_date=today,
+        character_count=character_count,
+    )
+
+    # 아래 명령어에만 답장합니다. 일반 대화에는 답장하지 않습니다.
+    reply = handle_command(
+        text.strip(),
+        group_id,
+        user_id,
+        today,
+    )
+
+    if reply:
+        reply_text(
+            event.get("replyToken"),
+            reply,
+        )
+
+
+# ==================================================
+# 직접 실행용
+# Render에서는 gunicorn app:app으로 실행합니다.
+# ==================================================
 
 if __name__ == "__main__":
-    init_database()
-
     app.run(
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 10000))
+        port=int(os.getenv("PORT", "10000")),
     )
