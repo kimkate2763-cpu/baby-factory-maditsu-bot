@@ -175,38 +175,46 @@ def reply_text(reply_token, text):
 
 
 def reply_mention(reply_token, text, members):
-    """등록된 사용자를 LINE의 실제 멘션 형식으로 태그합니다."""
+    """LINE textV2 형식으로 등록된 인증자를 실제 멘션합니다."""
     if not reply_token or not LINE_CHANNEL_ACCESS_TOKEN:
+        logger.error("멘션 답장 중단: replyToken 또는 LINE 액세스 토큰이 없습니다.")
         return
     if not members:
         reply_text(reply_token, text)
         return
 
-    message_text = text
-    if not message_text.endswith("\n"):
-        message_text += "\n"
+    # LINE textV2는 {키} 자리에 mention substitution을 넣어야 실제 멘션이 됩니다.
+    # 일반 text 메시지의 mention 필드는 발신 메시지에서 실제 멘션을 만드는 방식이 아닙니다.
+    valid_members = [
+        member for member in members
+        if member.get("user_id") and str(member["user_id"]).startswith("U")
+    ][:20]  # LINE은 한 메시지에 최대 20명까지 멘션할 수 있습니다.
 
-    mentionees = []
-    for member in members:
-        name = member["display_name"] or ("사용자-" + member["user_id"][-6:])
-        mention_text = "@" + name
-        # LINE의 index/length는 UTF-16 코드 단위 기준입니다.
-        start = len(message_text.encode("utf-16-le")) // 2
-        length = len(mention_text.encode("utf-16-le")) // 2
-        message_text += mention_text
-        mentionees.append({
-            "index": start,
-            "length": length,
-            "type": "user",
-            "userId": member["user_id"],
-        })
+    if not valid_members:
+        logger.error("멘션 답장 실패: 유효한 인증자 user_id가 없습니다.")
+        reply_text(reply_token, text + "\n인증자 사용자 정보를 확인해 주세요.")
+        return
 
+    substitution = {}
+    placeholders = []
+    for index, member in enumerate(valid_members, start=1):
+        key = f"auth{index}"
+        placeholders.append("{" + key + "}")
+        substitution[key] = {
+            "type": "mention",
+            "mentionee": {
+                "type": "user",
+                "userId": member["user_id"],
+            },
+        }
+
+    message_text = str(text).rstrip() + "\n" + " ".join(placeholders)
     payload = {
         "replyToken": reply_token,
         "messages": [{
-            "type": "text",
+            "type": "textV2",
             "text": message_text[:4900],
-            "mention": {"mentionees": mentionees},
+            "substitution": substitution,
         }],
     }
 
@@ -219,12 +227,11 @@ def reply_mention(reply_token, text, members):
         )
         if not response.ok:
             logger.error(
-                "LINE 멘션 답장 실패: status=%s body=%s",
-                response.status_code, response.text[:1000]
+                "LINE 실제 멘션 답장 실패: status=%s body=%s payload=%s",
+                response.status_code, response.text[:1000], payload,
             )
-            # 실패 시 같은 replyToken 재사용은 보장되지 않으므로 로그에 남깁니다.
     except requests.RequestException:
-        logger.exception("LINE 멘션 답장 전송 중 오류 발생")
+        logger.exception("LINE 실제 멘션 답장 전송 중 오류 발생")
 
 
 # ==================================================
