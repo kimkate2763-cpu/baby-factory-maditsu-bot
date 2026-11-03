@@ -92,6 +92,15 @@ def init_database():
                     PRIMARY KEY (group_id, user_id)
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS group_admins (
+                    group_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    display_name TEXT NOT NULL DEFAULT '이름 미확인',
+                    registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (group_id, user_id)
+                )
+            """)
         _db_initialized = True
         logger.info("데이터베이스 초기화 완료")
 
@@ -295,6 +304,49 @@ def get_authenticators(group_id):
 
 
 # ==================================================
+# 관리자 등록/해제
+# ==================================================
+
+def register_admin(group_id, user_id, display_name):
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO group_admins (group_id, user_id, display_name)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (group_id, user_id)
+            DO UPDATE SET display_name = EXCLUDED.display_name,
+                          registered_at = NOW()
+            """,
+            (group_id, user_id, display_name),
+        )
+
+
+def unregister_admin(group_id, user_id):
+    with get_db() as conn:
+        cur = conn.execute(
+            """
+            DELETE FROM group_admins
+            WHERE group_id = %s AND user_id = %s
+            """,
+            (group_id, user_id),
+        )
+    return cur.rowcount
+
+
+def get_admins(group_id):
+    with get_db() as conn:
+        return conn.execute(
+            """
+            SELECT user_id, display_name
+            FROM group_admins
+            WHERE group_id = %s
+            ORDER BY registered_at ASC
+            """,
+            (group_id,),
+        ).fetchall()
+
+
+# ==================================================
 # 오늘의 개인 마딧수
 # ==================================================
 
@@ -429,6 +481,27 @@ def handle_command(text, group_id, user_id, today, display_name, reply_token):
         if removed:
             return f"{display_name}님이 인증자에서 해제되었습니다."
         return f"{display_name}님은 현재 인증자 명단에 등록되어 있지 않습니다."
+
+    if text == "관리자 등록":
+        register_admin(group_id, user_id, display_name)
+        return f"{display_name}님이 관리자로 등록되었습니다."
+
+    if text == "관리자 해제":
+        removed = unregister_admin(group_id, user_id)
+        if removed:
+            return f"{display_name}님이 관리자에서 해제되었습니다."
+        return f"{display_name}님은 현재 관리자 명단에 등록되어 있지 않습니다."
+
+    if text in ("*벙시", "*벙종"):
+        admins = get_admins(group_id)
+        if not admins:
+            return (
+                "등록된 관리자가 없습니다.\n"
+                "관리자로 등록할 분은 '관리자 등록'을 입력해 주세요."
+            )
+        message_text = "벙시요~" if text == "*벙시" else "벙종이요~"
+        reply_mention(reply_token, message_text, admins)
+        return "__MENTION_SENT__"
 
     if text in ("*여초1", "*남초1"):
         members = get_authenticators(group_id)
