@@ -1,96 +1,109 @@
-import os
-import hmac
-import hashlib
-import base64
-import logging
-import re
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
-from zoneinfo import ZoneInfo
+if not LINE_CHANNEL_SECRET:
+        logger.error("LINE_CHANNEL_SECRET이 설정되지 않았습니다.")
+        abort(500)
 
-import requests
-import psycopg
-from psycopg.rows import dict_row
-from psycopg_pool import ConnectionPool
-from flask import Flask, request, jsonify, abort
+    digest = hmac.new(
+        LINE_CHANNEL_SECRET.encode("utf-8"), body, hashlib.sha256
+    ).digest()
+    expected_signature = base64.b64encode(digest).decode("utf-8")
+
+    if not hmac.compare_digest(expected_signature, signature):
+        logger.warning("LINE 웹훅 서명 검증 실패")
+        abort(400)
+
+    try:
+        payload = request.get_json(force=True)
+        for event in payload.get("events", []):
+            try:
+                process_event(event)
+            except Exception:
+                logger.exception("LINE 이벤트 처리 실패")
+        return "OK", 200
+    except Exception:
+        logger.exception("웹훅 처리 중 오류 발생")
+        return "ERROR", 500
 
 
 # ==================================================
-# 기본 설정
+# 개별 이벤트 처리
 # ==================================================
 
-app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("baby-factory-maditsu-bot")
+def process_event(event):
+    started_at = time.monotonic()
+    if event.get("type") != "message":
+        return
 
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "").strip()
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-KST = ZoneInfo("Asia/Seoul")
+    message = event.get("message", {})
+    if message.get("type") != "text":
+        return
 
-http = requests.Session()
-_db_init_lock = threading.Lock()
-_db_initialized = False
+    source = event.get("source", {})
+    source_type = source.get("type")
+    if source_type == "group":
+        group_id = source.get("groupId")
+    elif source_type == "room":
+        group_id = source.get("roomId")
+    else:
+        return
 
-# DB 연결을 매 메시지마다 새로 만들지 않도록 연결 풀을 사용합니다.
-_db_pool = None
-if DATABASE_URL:
-    _db_pool = ConnectionPool(
-        conninfo=DATABASE_URL,
-        min_size=1,
-        max_size=8,
-        timeout=5,
-        kwargs={"row_factory": dict_row, "connect_timeout": 5},
-        open=True,
+    user_id = source.get("userId")
+    message_id = message.get("id")
+    raw_text = message.get("text", "")
+    normalized_text = raw_text.strip()
+
+    if not group_id or not user_id or not message_id:
+        logger.warning("필수 이벤트 정보가 없어 건너뜁니다.")
+        return
+
+    today = datetime.now(KST).date()
+    # 프로필이 캐시에 없으면 임시 이름을 즉시 사용하고, 조회는 백그라운드로 진행합니다.
+    display_name = get_display_name(source, group_id, user_id)
+    character_count = len(re.sub(r"\s+", "", raw_text))
+
+    # 마딧수는 일반 채팅도 기록해야 하므로 DB 기록은 유지합니다.
+    # 연결 풀을 사용해 매번 DB 연결을 새로 여는 비용을 줄입니다.
+    record_message(
+        event_id=message_id,
+        group_id=group_id,
+        user_id=user_id,
+        display_name=display_name,
+        message_date=today,
+        character_count=character_count,
+    )
+    # 핵심 최적화: 일반 채팅은 명령어 처리/정규식/통계 조회를 하지 않고 여기서 종료합니다.
+    if not is_command(normalized_text):
+        # 프로필 조회는 백그라운드로 예약하므로 일반 채팅 요청을 기다리게 하지 않습니다.
+        schedule_profile_lookup(source, group_id, user_id)
+        elapsed = time.monotonic() - started_at
+        if elapsed >= 1.0:
+            logger.warning("일반 메시지 기록 지연: %.2f초", elapsed)
+        return
+
+    reply = handle_command(
+        normalized_text,
+        group_id,
+        user_id,
+        today,
+        display_name,
+        event.get("replyToken"),
     )
 
-# 프로필 조회는 별도 작업 스레드에서 처리해 LINE API 지연이 웹훅을 막지 않게 합니다.
-_PROFILE_CACHE = {}
-_PROFILE_CACHE_LOCK = threading.Lock()
-_PROFILE_CACHE_TTL = 600  # 10분
-_PROFILE_LOOKUPS_IN_FLIGHT = set()
-_PROFILE_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="line-profile")
+    # 멘션 명령은 handle_command 내부에서 이미 답장했습니다.
+    if reply and reply != "__MENTION_SENT__":
+        reply_text(event.get("replyToken"), reply)
+
+    # 명령어 처리(관리자/인증자 등록 포함)가 끝난 뒤 이름을 비동기로 보정합니다.
+    schedule_profile_lookup(source, group_id, user_id)
+
+    elapsed = time.monotonic() - started_at
+    if elapsed >= 1.0:
+        logger.warning("명령어 처리 지연: %.2f초, 명령어=%r", elapsed, normalized_text)
 
 
 # ==================================================
-# 데이터베이스 연결 및 초기화
+# 직접 실행용
+# Render 실행 명령: gunicorn app:app
 # ==================================================
 
-def get_db():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL 환경변수가 설정되지 않았습니다.")
-    if _db_pool is None:
-        raise RuntimeError("데이터베이스 연결 풀이 초기화되지 않았습니다.")
-    return _db_pool.connection(timeout=5)
-
-
-def init_database():
-    global _db_initialized
-    if _db_initialized:
-        return
-    with _db_init_lock:
-        if _db_initialized:
-            return
-        with get_db() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS message_events (
-                    event_id TEXT PRIMARY KEY,
-                    group_id TEXT NOT NULL,
-                    user_id TEXT NOT NULL,
-                    display_name TEXT NOT NULL DEFAULT '이름 미확인',
-                    message_date DATE NOT NULL,
-                    character_count INTEGER NOT NULL DEFAULT 0,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                )
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_message_group_date
-                ON message_events (group_id, message_date)
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_message_group_user_date
-                ON message_events (group_id, user_id, message_date)
-            """)
-            conn.execute("""
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
