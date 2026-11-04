@@ -141,7 +141,7 @@ def get_display_name(source, group_id, user_id):
         url = f"https://api.line.me/v2/bot/profile/{user_id}"
 
     try:
-        response = http.get(url, headers=line_headers(), timeout=3)
+        response = http.get(url, headers=line_headers(), timeout=1.5)
         if response.ok:
             name = response.json().get("displayName")
             if name:
@@ -503,7 +503,8 @@ def handle_command(text, group_id, user_id, today, display_name, reply_token):
         reply_mention(reply_token, message_text, admins)
         return "__MENTION_SENT__"
 
-    if text in ("*여초1", "*남초1"):
+    # *여초 / *남초를 기본 명령어로 지원하고, 기존 *여초1 / *남초1도 호환합니다.
+    if text in ("*여초", "*남초", "*여초1", "*남초1"):
         members = get_authenticators(group_id)
         if not members:
             return (
@@ -597,6 +598,7 @@ def callback():
 # ==================================================
 
 def process_event(event):
+    started_at = time.monotonic()
     if event.get("type") != "message":
         return
 
@@ -648,6 +650,10 @@ def process_event(event):
     # 멘션 명령은 handle_command 내부에서 이미 답장했습니다.
     if reply and reply != "__MENTION_SENT__":
         reply_text(event.get("replyToken"), reply)
+
+    elapsed = time.monotonic() - started_at
+    if elapsed >= 1.0:
+        logger.warning("이벤트 처리 지연: %.2f초, 명령어=%r", elapsed, text.strip())
 
 
 # ==================================================
