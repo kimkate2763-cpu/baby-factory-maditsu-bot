@@ -1,4 +1,3 @@
-
 import os
 import hmac
 import hashlib
@@ -15,9 +14,7 @@ import requests
 from requests.adapters import HTTPAdapter
 import psycopg
 from psycopg.rows import dict_row
-from psycopg_pool import ConnectionPool
 from flask import Flask, request, jsonify, abort
-
 
 # ==================================================
 # 기본 설정
@@ -36,61 +33,185 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 KST = ZoneInfo("Asia/Seoul")
 
+# LINE HTTP 연결 재사용
 http = requests.Session()
 http.mount(
     "https://",
     HTTPAdapter(pool_connections=4, pool_maxsize=8),
 )
 
+# ==================================================
+# 데이터베이스
+# ==================================================
+#
+# 기존 psycopg_pool ConnectionPool에서 PoolTimeout이 반복되었기 때문에
+# 앱 내부에서는 DB 연결 1개만 사용하고 전역 잠금으로 직렬화합니다.
+#
+# 이 봇은 소규모 LINE 방의 마딧수 기록용이므로 동시에 여러 DB 연결을
+# 사용할 필요가 없습니다.
+#
+# 장점:
+# - psycopg_pool.PoolTimeout 자체가 발생하지 않음
+# - 일반 채팅과 프로필 작업이 DB 연결을 서로 뺏지 않음
+# - DB 연결이 끊기면 자동 재연결
+# - Neon에 동시에 여러 연결을 열지 않음
+#
+# DB가 일시적으로 느리면 작업이 순서대로 처리됩니다.
+# 대신 기존처럼 여러 연결이 고갈되어 봇 전체가 멈추는 구조를 제거합니다.
+
+_db_lock = threading.RLock()
+_db_connection = None
+_db_connection_created_at = 0.0
 _db_init_lock = threading.Lock()
 _db_initialized = False
 
-# Neon Pooled connection 주소를 DATABASE_URL에 사용합니다.
-# 앱 내부 연결 풀의 대기 시간을 늘리고 연결 개수를 제한합니다.
-_db_pool = None
-
-if DATABASE_URL:
-    _db_pool = ConnectionPool(
-        conninfo=DATABASE_URL,
-        min_size=1,
-        max_size=8,
-        timeout=10,
-        kwargs={
-            "row_factory": dict_row,
-            "connect_timeout": 5,
-        },
-        open=True,
-    )
-
-# 프로필 조회가 DB 연결을 과도하게 점유하지 않도록
-# 백그라운드 작업자를 4명에서 2명으로 줄입니다.
-_PROFILE_CACHE = {}
-_PROFILE_CACHE_LOCK = threading.Lock()
-_PROFILE_CACHE_TTL = 600
-_PROFILE_LOOKUPS_IN_FLIGHT = set()
-
-_PROFILE_EXECUTOR = ThreadPoolExecutor(
-    max_workers=2,
-    thread_name_prefix="line-profile",
-)
+DB_CONNECT_TIMEOUT = 5
+DB_RECONNECT_AFTER = 1800  # 30분마다 연결을 새로 교체
 
 
-# ==================================================
-# 데이터베이스 연결
-# ==================================================
+def _close_db_locked():
+    global _db_connection
 
-def get_db():
+    conn = _db_connection
+    _db_connection = None
+
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            logger.exception("기존 DB 연결 종료 실패")
+
+
+def _connect_db_locked():
+    global _db_connection, _db_connection_created_at
+
     if not DATABASE_URL:
         raise RuntimeError(
             "DATABASE_URL 환경변수가 설정되지 않았습니다."
         )
 
-    if _db_pool is None:
-        raise RuntimeError(
-            "데이터베이스 연결 풀이 초기화되지 않았습니다."
-        )
+    _close_db_locked()
 
-    return _db_pool.connection(timeout=10)
+    conn = psycopg.connect(
+        DATABASE_URL,
+        row_factory=dict_row,
+        connect_timeout=DB_CONNECT_TIMEOUT,
+        autocommit=False,
+    )
+
+    # 하나의 DB 쿼리가 비정상적으로 오래 걸리는 것을 방지합니다.
+    conn.execute("SET statement_timeout = '8000ms'")
+    conn.commit()
+
+    _db_connection = conn
+    _db_connection_created_at = time.monotonic()
+
+    logger.info("DB 연결 생성 완료")
+    return conn
+
+
+def _get_connection_locked():
+    global _db_connection
+
+    if _db_connection is None or _db_connection.closed:
+        return _connect_db_locked()
+
+    if (
+        time.monotonic() - _db_connection_created_at
+        >= DB_RECONNECT_AFTER
+    ):
+        logger.info("DB 연결 수명 갱신")
+        return _connect_db_locked()
+
+    return _db_connection
+
+
+def _is_connection_error(exc):
+    if isinstance(exc, (
+        psycopg.OperationalError,
+        psycopg.InterfaceError,
+    )):
+        return True
+
+    text = str(exc).lower()
+
+    return any(
+        key in text
+        for key in (
+            "server closed",
+            "connection is closed",
+            "connection not open",
+            "connection refused",
+            "connection reset",
+            "ssl connection",
+            "broken pipe",
+        )
+    )
+
+
+def db_execute(sql, params=None, *, fetchone=False, fetchall=False):
+    """
+    짧은 DB 작업 전용 함수.
+
+    fetchone=True  -> dict 또는 None
+    fetchall=True  -> list[dict]
+    그 외          -> cursor.rowcount
+    """
+    global _db_connection
+
+    if not _db_initialized:
+        init_database()
+
+    last_error = None
+
+    # 연결 오류가 발생한 경우 새 연결로 한 번 재시도합니다.
+    for attempt in range(2):
+        try:
+            with _db_lock:
+                conn = _get_connection_locked()
+
+                try:
+                    cur = conn.execute(sql, params)
+
+                    if fetchone:
+                        result = cur.fetchone()
+                    elif fetchall:
+                        result = cur.fetchall()
+                    else:
+                        result = cur.rowcount
+
+                    conn.commit()
+                    return result
+
+                except Exception as exc:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+
+                    if _is_connection_error(exc):
+                        logger.warning(
+                            "DB 연결 오류. 연결을 재생성합니다. "
+                            "attempt=%s error=%s",
+                            attempt + 1,
+                            exc,
+                        )
+                        _close_db_locked()
+                        last_error = exc
+                        continue
+
+                    raise
+
+        except Exception as exc:
+            last_error = exc
+
+            if attempt == 0 and _is_connection_error(exc):
+                time.sleep(0.2)
+                continue
+
+            raise
+
+    raise last_error
 
 
 def init_database():
@@ -103,64 +224,95 @@ def init_database():
         if _db_initialized:
             return
 
-        with get_db() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS message_events (
-                    event_id TEXT PRIMARY KEY,
-                    group_id TEXT NOT NULL,
-                    user_id TEXT NOT NULL,
-                    display_name TEXT NOT NULL DEFAULT '이름 미확인',
-                    message_date DATE NOT NULL,
-                    character_count INTEGER NOT NULL DEFAULT 0,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                )
-            """)
+        with _db_lock:
+            conn = _get_connection_locked()
 
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_message_group_date
-                ON message_events (group_id, message_date)
-            """)
+            try:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS message_events (
+                        event_id TEXT PRIMARY KEY,
+                        group_id TEXT NOT NULL,
+                        user_id TEXT NOT NULL,
+                        display_name TEXT NOT NULL DEFAULT '이름 미확인',
+                        message_date DATE NOT NULL,
+                        character_count INTEGER NOT NULL DEFAULT 0,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                """)
 
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_message_group_user_date
-                ON message_events (group_id, user_id, message_date)
-            """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_message_group_date
+                    ON message_events (group_id, message_date)
+                """)
 
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_message_group_date_user
-                ON message_events (group_id, message_date, user_id)
-            """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_message_group_user_date
+                    ON message_events (group_id, user_id, message_date)
+                """)
 
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS group_authenticators (
-                    group_id TEXT NOT NULL,
-                    user_id TEXT NOT NULL,
-                    display_name TEXT NOT NULL DEFAULT '이름 미확인',
-                    registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    PRIMARY KEY (group_id, user_id)
-                )
-            """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_message_group_date_user
+                    ON message_events (group_id, message_date, user_id)
+                """)
 
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS group_admins (
-                    group_id TEXT NOT NULL,
-                    user_id TEXT NOT NULL,
-                    display_name TEXT NOT NULL DEFAULT '이름 미확인',
-                    registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    PRIMARY KEY (group_id, user_id)
-                )
-            """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS group_authenticators (
+                        group_id TEXT NOT NULL,
+                        user_id TEXT NOT NULL,
+                        display_name TEXT NOT NULL DEFAULT '이름 미확인',
+                        registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        PRIMARY KEY (group_id, user_id)
+                    )
+                """)
 
-        _db_initialized = True
-        logger.info("데이터베이스 초기화 완료")
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS group_admins (
+                        group_id TEXT NOT NULL,
+                        user_id TEXT NOT NULL,
+                        display_name TEXT NOT NULL DEFAULT '이름 미확인',
+                        registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        PRIMARY KEY (group_id, user_id)
+                    )
+                """)
+
+                conn.commit()
+                _db_initialized = True
+                logger.info("데이터베이스 초기화 완료")
+
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
 
 
-init_database()
+# 앱 시작 시 DB를 한 번 초기화합니다.
+# DB가 잠시 불안정해도 프로세스 자체는 살아 있게 하고,
+# 첫 DB 작업 때 다시 초기화를 시도합니다.
+try:
+    init_database()
+except Exception:
+    logger.exception(
+        "앱 시작 시 DB 초기화 실패. 이후 요청에서 재시도합니다."
+    )
 
 
 # ==================================================
 # LINE 프로필
 # ==================================================
+
+_PROFILE_CACHE = {}
+_PROFILE_CACHE_LOCK = threading.Lock()
+_PROFILE_CACHE_TTL = 600
+_PROFILE_LOOKUPS_IN_FLIGHT = set()
+
+# 프로필 작업은 한 번에 하나만 실행합니다.
+_PROFILE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="line-profile",
+)
+
 
 def line_headers():
     return {
@@ -188,7 +340,6 @@ def _profile_url(source, group_id, user_id):
 
 
 def _fetch_profile_name(source, group_id, user_id, cache_key):
-    """프로필을 백그라운드에서 조회하고 임시 이름을 보정합니다."""
     try:
         if not LINE_CHANNEL_ACCESS_TOKEN:
             return
@@ -216,42 +367,40 @@ def _fetch_profile_name(source, group_id, user_id, cache_key):
 
         fallback_name = "사용자-" + user_id[-6:]
 
-        # 이 작업은 백그라운드에서만 실행합니다.
-        # DB 오류가 나더라도 메시지 명령어 처리에는 영향을 주지 않습니다.
+        # 프로필 DB 갱신은 메시지 처리와 완전히 분리합니다.
         try:
-            with get_db() as conn:
-                conn.execute(
-                    """
-                    UPDATE message_events
-                    SET display_name = %s
-                    WHERE group_id = %s
-                      AND user_id = %s
-                      AND display_name = %s
-                    """,
-                    (name, group_id, user_id, fallback_name),
-                )
+            db_execute(
+                """
+                UPDATE message_events
+                SET display_name = %s
+                WHERE group_id = %s
+                  AND user_id = %s
+                  AND display_name = %s
+                """,
+                (name, group_id, user_id, fallback_name),
+            )
 
-                conn.execute(
-                    """
-                    UPDATE group_authenticators
-                    SET display_name = %s
-                    WHERE group_id = %s
-                      AND user_id = %s
-                      AND display_name = %s
-                    """,
-                    (name, group_id, user_id, fallback_name),
-                )
+            db_execute(
+                """
+                UPDATE group_authenticators
+                SET display_name = %s
+                WHERE group_id = %s
+                  AND user_id = %s
+                  AND display_name = %s
+                """,
+                (name, group_id, user_id, fallback_name),
+            )
 
-                conn.execute(
-                    """
-                    UPDATE group_admins
-                    SET display_name = %s
-                    WHERE group_id = %s
-                      AND user_id = %s
-                      AND display_name = %s
-                    """,
-                    (name, group_id, user_id, fallback_name),
-                )
+            db_execute(
+                """
+                UPDATE group_admins
+                SET display_name = %s
+                WHERE group_id = %s
+                  AND user_id = %s
+                  AND display_name = %s
+                """,
+                (name, group_id, user_id, fallback_name),
+            )
 
         except Exception:
             logger.exception("프로필 이름 DB 갱신 실패")
@@ -321,11 +470,13 @@ def schedule_profile_lookup(source, group_id, user_id):
 
 def reply_text(reply_token, text):
     if not reply_token:
-        return
+        return False
 
     if not LINE_CHANNEL_ACCESS_TOKEN:
-        logger.error("LINE 액세스 토큰이 설정되지 않았습니다.")
-        return
+        logger.error(
+            "LINE 액세스 토큰이 설정되지 않았습니다."
+        )
+        return False
 
     try:
         response = http.post(
@@ -349,32 +500,37 @@ def reply_text(reply_token, text):
                 response.status_code,
                 response.text[:800],
             )
+            return False
+
+        return True
 
     except requests.RequestException:
         logger.exception("LINE 답장 전송 중 오류")
+        return False
 
 
 def reply_mention(reply_token, text, members):
     if not reply_token or not LINE_CHANNEL_ACCESS_TOKEN:
-        logger.error("멘션 답장에 필요한 설정이 없습니다.")
-        return
+        logger.error(
+            "멘션 답장에 필요한 설정이 없습니다."
+        )
+        return False
 
     if not members:
-        reply_text(reply_token, text)
-        return
+        return reply_text(reply_token, text)
 
     valid_members = [
-        member for member in members
+        member
+        for member in members
         if member.get("user_id")
         and str(member["user_id"]).startswith("U")
     ][:20]
 
     if not valid_members:
-        reply_text(
+        return reply_text(
             reply_token,
             text + "\n등록된 사용자 정보를 확인해 주세요.",
         )
-        return
 
     substitution = {}
     placeholders = []
@@ -391,7 +547,11 @@ def reply_mention(reply_token, text, members):
             },
         }
 
-    message_text = str(text).rstrip() + "\n" + " ".join(placeholders)
+    message_text = (
+        str(text).rstrip()
+        + "\n"
+        + " ".join(placeholders)
+    )
 
     payload = {
         "replyToken": reply_token,
@@ -418,9 +578,13 @@ def reply_mention(reply_token, text, members):
                 response.status_code,
                 response.text[:1000],
             )
+            return False
+
+        return True
 
     except requests.RequestException:
         logger.exception("LINE 멘션 전송 중 오류")
+        return False
 
 
 # ==================================================
@@ -437,35 +601,37 @@ def record_message(
 ):
     started = time.monotonic()
 
-    with get_db() as conn:
-        conn.execute(
-            """
-            INSERT INTO message_events
-                (
-                    event_id,
-                    group_id,
-                    user_id,
-                    display_name,
-                    message_date,
-                    character_count
-                )
-            VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (event_id) DO NOTHING
-            """,
+    db_execute(
+        """
+        INSERT INTO message_events
             (
                 event_id,
                 group_id,
                 user_id,
                 display_name,
                 message_date,
-                character_count,
-            ),
-        )
+                character_count
+            )
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (event_id) DO NOTHING
+        """,
+        (
+            event_id,
+            group_id,
+            user_id,
+            display_name,
+            message_date,
+            character_count,
+        ),
+    )
 
     elapsed = time.monotonic() - started
 
     if elapsed >= 1:
-        logger.warning("메시지 DB 기록 지연: %.2f초", elapsed)
+        logger.warning(
+            "메시지 DB 기록 지연: %.2f초",
+            elapsed,
+        )
 
 
 # ==================================================
@@ -473,45 +639,41 @@ def record_message(
 # ==================================================
 
 def register_authenticator(group_id, user_id, display_name):
-    with get_db() as conn:
-        conn.execute(
-            """
-            INSERT INTO group_authenticators
-                (group_id, user_id, display_name)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (group_id, user_id)
-            DO UPDATE SET
-                display_name = EXCLUDED.display_name,
-                registered_at = NOW()
-            """,
-            (group_id, user_id, display_name),
-        )
+    db_execute(
+        """
+        INSERT INTO group_authenticators
+            (group_id, user_id, display_name)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (group_id, user_id)
+        DO UPDATE SET
+            display_name = EXCLUDED.display_name,
+            registered_at = NOW()
+        """,
+        (group_id, user_id, display_name),
+    )
 
 
 def unregister_authenticator(group_id, user_id):
-    with get_db() as conn:
-        cur = conn.execute(
-            """
-            DELETE FROM group_authenticators
-            WHERE group_id = %s AND user_id = %s
-            """,
-            (group_id, user_id),
-        )
-
-        return cur.rowcount
+    return db_execute(
+        """
+        DELETE FROM group_authenticators
+        WHERE group_id = %s AND user_id = %s
+        """,
+        (group_id, user_id),
+    )
 
 
 def get_authenticators(group_id):
-    with get_db() as conn:
-        return conn.execute(
-            """
-            SELECT user_id, display_name
-            FROM group_authenticators
-            WHERE group_id = %s
-            ORDER BY registered_at ASC
-            """,
-            (group_id,),
-        ).fetchall()
+    return db_execute(
+        """
+        SELECT user_id, display_name
+        FROM group_authenticators
+        WHERE group_id = %s
+        ORDER BY registered_at ASC
+        """,
+        (group_id,),
+        fetchall=True,
+    )
 
 
 # ==================================================
@@ -519,45 +681,41 @@ def get_authenticators(group_id):
 # ==================================================
 
 def register_admin(group_id, user_id, display_name):
-    with get_db() as conn:
-        conn.execute(
-            """
-            INSERT INTO group_admins
-                (group_id, user_id, display_name)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (group_id, user_id)
-            DO UPDATE SET
-                display_name = EXCLUDED.display_name,
-                registered_at = NOW()
-            """,
-            (group_id, user_id, display_name),
-        )
+    db_execute(
+        """
+        INSERT INTO group_admins
+            (group_id, user_id, display_name)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (group_id, user_id)
+        DO UPDATE SET
+            display_name = EXCLUDED.display_name,
+            registered_at = NOW()
+        """,
+        (group_id, user_id, display_name),
+    )
 
 
 def unregister_admin(group_id, user_id):
-    with get_db() as conn:
-        cur = conn.execute(
-            """
-            DELETE FROM group_admins
-            WHERE group_id = %s AND user_id = %s
-            """,
-            (group_id, user_id),
-        )
-
-        return cur.rowcount
+    return db_execute(
+        """
+        DELETE FROM group_admins
+        WHERE group_id = %s AND user_id = %s
+        """,
+        (group_id, user_id),
+    )
 
 
 def get_admins(group_id):
-    with get_db() as conn:
-        return conn.execute(
-            """
-            SELECT user_id, display_name
-            FROM group_admins
-            WHERE group_id = %s
-            ORDER BY registered_at ASC
-            """,
-            (group_id,),
-        ).fetchall()
+    return db_execute(
+        """
+        SELECT user_id, display_name
+        FROM group_admins
+        WHERE group_id = %s
+        ORDER BY registered_at ASC
+        """,
+        (group_id,),
+        fetchall=True,
+    )
 
 
 # ==================================================
@@ -565,36 +723,35 @@ def get_admins(group_id):
 # ==================================================
 
 def get_my_stats(group_id, user_id, today, display_name):
-    with get_db() as conn:
-        row = conn.execute(
-            """
-            WITH daily_counts AS (
-                SELECT
-                    user_id,
-                    MAX(display_name) AS display_name,
-                    COUNT(*) AS message_count,
-                    COALESCE(SUM(character_count), 0) AS character_count
-                FROM message_events
-                WHERE group_id = %s
-                  AND message_date = %s
-                GROUP BY user_id
-            ),
-            ranked AS (
-                SELECT
-                    user_id,
-                    message_count,
-                    character_count,
-                    RANK() OVER (
-                        ORDER BY message_count DESC
-                    ) AS user_rank
-                FROM daily_counts
-            )
-            SELECT message_count, character_count, user_rank
-            FROM ranked
-            WHERE user_id = %s
-            """,
-            (group_id, today, user_id),
-        ).fetchone()
+    row = db_execute(
+        """
+        WITH daily_counts AS (
+            SELECT
+                user_id,
+                COUNT(*) AS message_count,
+                COALESCE(SUM(character_count), 0) AS character_count
+            FROM message_events
+            WHERE group_id = %s
+              AND message_date = %s
+            GROUP BY user_id
+        ),
+        ranked AS (
+            SELECT
+                user_id,
+                message_count,
+                character_count,
+                RANK() OVER (
+                    ORDER BY message_count DESC
+                ) AS user_rank
+            FROM daily_counts
+        )
+        SELECT message_count, character_count, user_rank
+        FROM ranked
+        WHERE user_id = %s
+        """,
+        (group_id, today, user_id),
+        fetchone=True,
+    )
 
     if row:
         count = row["message_count"]
@@ -614,38 +771,39 @@ def get_my_stats(group_id, user_id, today, display_name):
 
 
 def get_ranking(group_id, start_date, end_date, title):
-    with get_db() as conn:
-        rows = conn.execute(
-            """
-            SELECT
-                user_id,
-                MAX(display_name) AS display_name,
-                COUNT(*) AS message_count
-            FROM message_events
-            WHERE group_id = %s
-              AND message_date >= %s
-              AND message_date <= %s
-            GROUP BY user_id
-            ORDER BY
-                message_count DESC,
-                LOWER(MAX(display_name)) ASC
-            LIMIT 50
-            """,
-            (group_id, start_date, end_date),
-        ).fetchall()
+    rows = db_execute(
+        """
+        SELECT
+            user_id,
+            MAX(display_name) AS display_name,
+            COUNT(*) AS message_count
+        FROM message_events
+        WHERE group_id = %s
+          AND message_date >= %s
+          AND message_date <= %s
+        GROUP BY user_id
+        ORDER BY
+            message_count DESC,
+            LOWER(MAX(display_name)) ASC
+        LIMIT 50
+        """,
+        (group_id, start_date, end_date),
+        fetchall=True,
+    )
 
-        summary = conn.execute(
-            """
-            SELECT
-                COUNT(*) AS total_messages,
-                COUNT(DISTINCT user_id) AS participant_count
-            FROM message_events
-            WHERE group_id = %s
-              AND message_date >= %s
-              AND message_date <= %s
-            """,
-            (group_id, start_date, end_date),
-        ).fetchone()
+    summary = db_execute(
+        """
+        SELECT
+            COUNT(*) AS total_messages,
+            COUNT(DISTINCT user_id) AS participant_count
+        FROM message_events
+        WHERE group_id = %s
+          AND message_date >= %s
+          AND message_date <= %s
+        """,
+        (group_id, start_date, end_date),
+        fetchone=True,
+    )
 
     lines = [
         f"마딧수 순위: {title}",
@@ -722,22 +880,33 @@ def handle_command(
 ):
     if text == "내 마딧수":
         return get_my_stats(
-            group_id, user_id, today, display_name
+            group_id,
+            user_id,
+            today,
+            display_name,
         )
 
     if text == "*마딧수":
         return get_ranking(
-            group_id, today, today, str(today)
+            group_id,
+            today,
+            today,
+            str(today),
         )
 
     if text == "인증자 등록":
         register_authenticator(
-            group_id, user_id, display_name
+            group_id,
+            user_id,
+            display_name,
         )
         return f"{display_name}님이 인증자로 등록되었습니다."
 
     if text == "인증자 해제":
-        removed = unregister_authenticator(group_id, user_id)
+        removed = unregister_authenticator(
+            group_id,
+            user_id,
+        )
 
         if removed:
             return f"{display_name}님이 인증자에서 해제되었습니다."
@@ -748,11 +917,18 @@ def handle_command(
         )
 
     if text == "관리자 등록":
-        register_admin(group_id, user_id, display_name)
+        register_admin(
+            group_id,
+            user_id,
+            display_name,
+        )
         return f"{display_name}님이 관리자로 등록되었습니다."
 
     if text == "관리자 해제":
-        removed = unregister_admin(group_id, user_id)
+        removed = unregister_admin(
+            group_id,
+            user_id,
+        )
 
         if removed:
             return f"{display_name}님이 관리자에서 해제되었습니다."
@@ -772,11 +948,21 @@ def handle_command(
             )
 
         message_text = (
-            "벙시요~" if text == "*벙시" else "벙종이요~"
+            "벙시요~"
+            if text == "*벙시"
+            else "벙종이요~"
         )
 
-        reply_mention(reply_token, message_text, admins)
-        return "__MENTION_SENT__"
+        sent = reply_mention(
+            reply_token,
+            message_text,
+            admins,
+        )
+
+        if sent:
+            return "__MENTION_SENT__"
+
+        return None
 
     if text in ("*여초", "*남초", "*여초1", "*남초1"):
         members = get_authenticators(group_id)
@@ -787,19 +973,29 @@ def handle_command(
                 "인증자로 참여할 분은 '인증자 등록'을 입력해 주세요."
             )
 
-        reply_mention(reply_token, text, members)
-        return "__MENTION_SENT__"
+        sent = reply_mention(
+            reply_token,
+            text,
+            members,
+        )
+
+        if sent:
+            return "__MENTION_SENT__"
+
+        return None
 
     match = RANGE_COMMAND_RE.fullmatch(text)
 
     if match:
         try:
             start_date = datetime.strptime(
-                match.group(1), "%Y-%m-%d"
+                match.group(1),
+                "%Y-%m-%d",
             ).date()
 
             end_date = datetime.strptime(
-                match.group(2), "%Y-%m-%d"
+                match.group(2),
+                "%Y-%m-%d",
             ).date()
 
         except ValueError:
@@ -833,8 +1029,7 @@ def home():
 @app.route("/health", methods=["GET"])
 def health():
     try:
-        with get_db() as conn:
-            conn.execute("SELECT 1")
+        db_execute("SELECT 1")
 
         return jsonify({
             "status": "ok",
@@ -860,7 +1055,9 @@ def callback():
     signature = request.headers.get("X-Line-Signature", "")
 
     if not LINE_CHANNEL_SECRET:
-        logger.error("LINE_CHANNEL_SECRET이 설정되지 않았습니다.")
+        logger.error(
+            "LINE_CHANNEL_SECRET이 설정되지 않았습니다."
+        )
         abort(500)
 
     digest = hmac.new(
@@ -873,7 +1070,10 @@ def callback():
         digest
     ).decode("utf-8")
 
-    if not hmac.compare_digest(expected_signature, signature):
+    if not hmac.compare_digest(
+        expected_signature,
+        signature,
+    ):
         logger.warning("LINE 웹훅 서명 검증 실패")
         abort(400)
 
@@ -932,37 +1132,40 @@ def process_event(event):
     today = datetime.now(KST).date()
 
     display_name = get_display_name(
-        source, group_id, user_id
+        source,
+        group_id,
+        user_id,
     )
 
     character_count = len(
         re.sub(r"\s+", "", raw_text)
     )
 
-    # 핵심 수정:
-    # 메시지 기록이 실패하더라도 명령어 처리까지 중단하지 않습니다.
-    # 다만 DB 장애 중에는 해당 메시지 기록이 누락될 수 있습니다.
-    try:
-        record_message(
-            event_id=message_id,
-            group_id=group_id,
-            user_id=user_id,
-            display_name=display_name,
-            message_date=today,
-            character_count=character_count,
-        )
+    command = is_command(normalized_text)
 
-    except Exception:
-        logger.exception(
-            "메시지 기록 실패: group_id=%s user_id=%s",
+    # 일반 채팅
+    if not command:
+        try:
+            record_message(
+                event_id=message_id,
+                group_id=group_id,
+                user_id=user_id,
+                display_name=display_name,
+                message_date=today,
+                character_count=character_count,
+            )
+
+        except Exception:
+            logger.exception(
+                "메시지 기록 실패: group_id=%s user_id=%s",
+                group_id,
+                user_id,
+            )
+
+        schedule_profile_lookup(
+            source,
             group_id,
             user_id,
-        )
-
-    # 일반 채팅은 기록 후 종료합니다.
-    if not is_command(normalized_text):
-        schedule_profile_lookup(
-            source, group_id, user_id
         )
 
         elapsed = time.monotonic() - started_at
@@ -975,8 +1178,26 @@ def process_event(event):
 
         return
 
-    # 명령어 처리 중 DB 오류가 발생하면 로그를 남기고
-    # 사용자에게 오류 안내를 시도합니다.
+    # 명령어
+    #
+    # 명령어 메시지 기록이 실패해도 명령어 자체는 실행합니다.
+    try:
+        record_message(
+            event_id=message_id,
+            group_id=group_id,
+            user_id=user_id,
+            display_name=display_name,
+            message_date=today,
+            character_count=character_count,
+        )
+
+    except Exception:
+        logger.exception(
+            "명령어 메시지 기록 실패: group_id=%s user_id=%s",
+            group_id,
+            user_id,
+        )
+
     try:
         reply = handle_command(
             normalized_text,
@@ -988,7 +1209,10 @@ def process_event(event):
         )
 
         if reply and reply != "__MENTION_SENT__":
-            reply_text(reply_token, reply)
+            reply_text(
+                reply_token,
+                reply,
+            )
 
     except Exception:
         logger.exception(
@@ -1005,7 +1229,9 @@ def process_event(event):
 
     finally:
         schedule_profile_lookup(
-            source, group_id, user_id
+            source,
+            group_id,
+            user_id,
         )
 
     elapsed = time.monotonic() - started_at
@@ -1020,10 +1246,14 @@ def process_event(event):
 
 # ==================================================
 # 직접 실행
-# Render 실행 명령: gunicorn app:app
 # ==================================================
 
 if __name__ == "__main__":
+    try:
+        init_database()
+    except Exception:
+        logger.exception("시작 시 DB 초기화 실패")
+
     app.run(
         host="0.0.0.0",
         port=int(os.getenv("PORT", "10000")),
