@@ -264,16 +264,17 @@ def _profile_url(source, group_id, user_id):
 
 
 def _save_profile_name(group_id, user_id, name):
-    fallback_name = "사용자-" + user_id[-6:]
+    # 기존에 임시 이름(사용자-xxxxxx)으로 저장된 모든 기록을
+    # 실제 LINE 표시 이름으로 교체합니다.
     db_execute(
         """
         UPDATE message_events
         SET display_name = %s
         WHERE group_id = %s
           AND user_id = %s
-          AND display_name = %s
+          AND display_name LIKE '사용자-%%'
         """,
-        (name, group_id, user_id, fallback_name),
+        (name, group_id, user_id),
     )
     db_execute(
         """
@@ -281,9 +282,9 @@ def _save_profile_name(group_id, user_id, name):
         SET display_name = %s
         WHERE group_id = %s
           AND user_id = %s
-          AND display_name = %s
+          AND display_name LIKE '사용자-%%'
         """,
-        (name, group_id, user_id, fallback_name),
+        (name, group_id, user_id),
     )
     db_execute(
         """
@@ -291,9 +292,9 @@ def _save_profile_name(group_id, user_id, name):
         SET display_name = %s
         WHERE group_id = %s
           AND user_id = %s
-          AND display_name = %s
+          AND display_name LIKE '사용자-%%'
         """,
-        (name, group_id, user_id, fallback_name),
+        (name, group_id, user_id),
     )
 
 
@@ -658,7 +659,12 @@ def get_ranking(group_id, start_date, end_date, title):
         """
         SELECT
             user_id,
-            MAX(display_name) AS display_name,
+            COALESCE(
+                MAX(display_name) FILTER (
+                    WHERE display_name NOT LIKE '사용자-%%'
+                ),
+                MAX(display_name)
+            ) AS display_name,
             COUNT(*) AS message_count
         FROM message_events
         WHERE group_id = %s
@@ -787,7 +793,13 @@ def handle_command(text, group_id, user_id, today, display_name, reply_token):
         message_text = "벙시요~" if text == "*벙시" else "벙종이요~"
         if reply_mention(reply_token, message_text, admins):
             return "__MENTION_SENT__"
-        return None
+
+        # 멘션 API가 실패해도 무응답으로 끝내지 않습니다.
+        names = ", ".join(
+            str(member.get("display_name") or "이름 미확인")
+            for member in admins
+        )
+        return f"{message_text}\n관리자: {names}"
 
     if text in ("*여초", "*남초", "*여초1", "*남초1"):
         members = get_authenticators(group_id)
@@ -799,7 +811,13 @@ def handle_command(text, group_id, user_id, today, display_name, reply_token):
 
         if reply_mention(reply_token, text, members):
             return "__MENTION_SENT__"
-        return None
+
+        # 멘션 API가 실패해도 무응답으로 끝내지 않습니다.
+        names = ", ".join(
+            str(member.get("display_name") or "이름 미확인")
+            for member in members
+        )
+        return f"{text}\n인증자: {names}"
 
     match = RANGE_COMMAND_RE.fullmatch(text)
     if match:
@@ -929,7 +947,7 @@ def process_event(event):
         source,
         group_id,
         user_id,
-        force_fetch=(normalized_text == "내 마딧수"),
+        force_fetch=command,
     )
 
     character_count = len(re.sub(r"\s+", "", raw_text))
