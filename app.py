@@ -264,8 +264,7 @@ def _profile_url(source, group_id, user_id):
 
 
 def _save_profile_name(group_id, user_id, name):
-    # 기존에 임시 이름(사용자-xxxxxx)으로 저장된 모든 기록을
-    # 실제 LINE 표시 이름으로 교체합니다.
+    fallback_name = "사용자-" + user_id[-6:]
     db_execute(
         """
         UPDATE message_events
@@ -424,6 +423,100 @@ def reply_text(reply_token, text):
     except requests.RequestException:
         logger.exception("LINE 답장 전송 중 오류")
         return False
+
+
+def _member_exists_in_group(source, group_id, user_id):
+    """현재 LINE 그룹/룸에 실제로 존재하는 사용자인지 확인합니다."""
+    if not LINE_CHANNEL_ACCESS_TOKEN or not user_id:
+        return None
+
+    try:
+        response = http.get(
+            _profile_url(source, group_id, user_id),
+            headers=line_headers(),
+            timeout=(2, 3),
+        )
+
+        if response.status_code == 200:
+            return True
+
+        if response.status_code == 404:
+            logger.warning(
+                "현재 그룹에 없는 멤버 감지: group_id=%s user_id=%s",
+                group_id,
+                user_id,
+            )
+            return False
+
+        # 403/429/5xx 같은 경우는 실제로 나간 사람인지 확정할 수 없으므로
+        # DB에서 삭제하지 않고 이번 멘션 대상에서만 제외합니다.
+        logger.warning(
+            "그룹 멤버 확인 실패: status=%s group_id=%s user_id=%s body=%s",
+            response.status_code,
+            group_id,
+            user_id,
+            response.text[:300],
+        )
+        return None
+
+    except requests.RequestException:
+        logger.warning(
+            "그룹 멤버 확인 네트워크 오류: group_id=%s user_id=%s",
+            group_id,
+            user_id,
+            exc_info=True,
+        )
+        return False
+
+
+def get_valid_mention_members(source, group_id, members, *, table_name):
+    """DB에는 남아 있지만 현재 방에는 없는 사용자를 멘션에서 제거합니다."""
+    valid_members = []
+    stale_user_ids = []
+
+    for member in members:
+        user_id = member.get("user_id")
+        if not user_id:
+            continue
+
+        member_status = _member_exists_in_group(source, group_id, user_id)
+        if member_status is True:
+            valid_members.append(member)
+        elif member_status is False:
+            stale_user_ids.append(user_id)
+        else:
+            # 확인 자체가 실패한 경우에는 DB에서 삭제하지 않습니다.
+            # 잘못된 자동 삭제를 막기 위해 이번 요청에서만 멘션 대상에서 제외합니다.
+            continue
+
+    if stale_user_ids:
+        if table_name == "admins":
+            for user_id in stale_user_ids:
+                db_execute(
+                    """
+                    DELETE FROM group_admins
+                    WHERE group_id = %s AND user_id = %s
+                    """,
+                    (group_id, user_id),
+                )
+        elif table_name == "authenticators":
+            for user_id in stale_user_ids:
+                db_execute(
+                    """
+                    DELETE FROM group_authenticators
+                    WHERE group_id = %s AND user_id = %s
+                    """,
+                    (group_id, user_id),
+                )
+
+        logger.info(
+            "현재 방에 없는 %s 자동 정리: group_id=%s count=%s",
+            table_name,
+            group_id,
+            len(stale_user_ids),
+        )
+
+    return valid_members
 
 
 def reply_mention(reply_token, text, members):
@@ -673,7 +766,14 @@ def get_ranking(group_id, start_date, end_date, title):
         GROUP BY user_id
         ORDER BY
             message_count DESC,
-            LOWER(MAX(display_name)) ASC
+            LOWER(
+                COALESCE(
+                    MAX(display_name) FILTER (
+                        WHERE display_name NOT LIKE '사용자-%%'
+                    ),
+                    MAX(display_name)
+                )
+            ) ASC
         LIMIT 50
         """,
         (group_id, start_date, end_date),
@@ -755,7 +855,7 @@ def is_command(text):
     )
 
 
-def handle_command(text, group_id, user_id, today, display_name, reply_token):
+def handle_command(text, source, group_id, user_id, today, display_name, reply_token):
     if text == "내 마딧수":
         return get_my_stats(group_id, user_id, today, display_name)
 
@@ -790,16 +890,21 @@ def handle_command(text, group_id, user_id, today, display_name, reply_token):
                 "관리자로 등록할 분은 '관리자 등록'을 입력해 주세요."
             )
 
+        # 본방을 나간 관리자가 DB에 남아 있어도 전체 멘션이 400으로
+        # 실패하지 않도록, 실제 그룹 멤버인지 먼저 확인하고 자동 정리합니다.
+        admins = get_valid_mention_members(
+            source, group_id, admins, table_name="admins"
+        )
+        if not admins:
+            return (
+                "현재 방에 있는 등록된 관리자가 없습니다.\n"
+                "관리자로 등록할 분은 '관리자 등록'을 입력해 주세요."
+            )
+
         message_text = "벙시요~" if text == "*벙시" else "벙종이요~"
         if reply_mention(reply_token, message_text, admins):
             return "__MENTION_SENT__"
-
-        # 멘션 API가 실패해도 무응답으로 끝내지 않습니다.
-        names = ", ".join(
-            str(member.get("display_name") or "이름 미확인")
-            for member in admins
-        )
-        return f"{message_text}\n관리자: {names}"
+        return None
 
     if text in ("*여초", "*남초", "*여초1", "*남초1"):
         members = get_authenticators(group_id)
@@ -809,15 +914,20 @@ def handle_command(text, group_id, user_id, today, display_name, reply_token):
                 "인증자로 참여할 분은 '인증자 등록'을 입력해 주세요."
             )
 
+        # 본방을 나간 인증자가 DB에 남아 있어도 전체 멘션이 400으로
+        # 실패하지 않도록 동일하게 자동 정리합니다.
+        members = get_valid_mention_members(
+            source, group_id, members, table_name="authenticators"
+        )
+        if not members:
+            return (
+                "현재 방에 있는 등록된 인증자가 없습니다.\n"
+                "인증자로 참여할 분은 '인증자 등록'을 입력해 주세요."
+            )
+
         if reply_mention(reply_token, text, members):
             return "__MENTION_SENT__"
-
-        # 멘션 API가 실패해도 무응답으로 끝내지 않습니다.
-        names = ", ".join(
-            str(member.get("display_name") or "이름 미확인")
-            for member in members
-        )
-        return f"{text}\n인증자: {names}"
+        return None
 
     match = RANGE_COMMAND_RE.fullmatch(text)
     if match:
@@ -979,6 +1089,7 @@ def process_event(event):
     try:
         reply = handle_command(
             normalized_text,
+            source,
             group_id,
             user_id,
             today,
