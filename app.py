@@ -244,7 +244,10 @@ _PROFILE_CACHE = {}
 _PROFILE_CACHE_LOCK = threading.Lock()
 _PROFILE_CACHE_TTL = 600
 _PROFILE_LOOKUPS_IN_FLIGHT = set()
-_PROFILE_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="line-profile")
+_PROFILE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="line-profile",
+)
 
 
 def line_headers():
@@ -256,15 +259,25 @@ def line_headers():
 
 def _profile_url(source, group_id, user_id):
     source_type = source.get("type")
+
     if source_type == "group" and group_id:
-        return f"https://api.line.me/v2/bot/group/{group_id}/member/{user_id}"
+        return (
+            f"https://api.line.me/v2/bot/group/"
+            f"{group_id}/member/{user_id}"
+        )
+
     if source_type == "room" and group_id:
-        return f"https://api.line.me/v2/bot/room/{group_id}/member/{user_id}"
+        return (
+            f"https://api.line.me/v2/bot/room/"
+            f"{group_id}/member/{user_id}"
+        )
+
     return f"https://api.line.me/v2/bot/profile/{user_id}"
 
 
 def _save_profile_name(group_id, user_id, name):
     fallback_name = "사용자-" + user_id[-6:]
+
     db_execute(
         """
         UPDATE message_events
@@ -275,6 +288,7 @@ def _save_profile_name(group_id, user_id, name):
         """,
         (name, group_id, user_id),
     )
+
     db_execute(
         """
         UPDATE group_authenticators
@@ -285,6 +299,7 @@ def _save_profile_name(group_id, user_id, name):
         """,
         (name, group_id, user_id),
     )
+
     db_execute(
         """
         UPDATE group_admins
@@ -317,6 +332,7 @@ def _fetch_profile_name(source, group_id, user_id, cache_key):
             return None
 
         name = response.json().get("displayName")
+
         if not name:
             return None
 
@@ -333,20 +349,33 @@ def _fetch_profile_name(source, group_id, user_id, cache_key):
     except requests.RequestException:
         logger.warning("프로필 조회 네트워크 오류", exc_info=True)
         return None
+
     except Exception:
         logger.exception("프로필 처리 중 오류")
         return None
+
     finally:
         with _PROFILE_CACHE_LOCK:
             _PROFILE_LOOKUPS_IN_FLIGHT.discard(cache_key)
 
 
-def get_display_name(source, group_id, user_id, *, force_fetch=False):
+def get_display_name(
+    source,
+    group_id,
+    user_id,
+    *,
+    force_fetch=False,
+):
     fallback_name = "사용자-" + user_id[-6:]
-    cache_key = (source.get("type"), group_id, user_id)
+    cache_key = (
+        source.get("type"),
+        group_id,
+        user_id,
+    )
 
     with _PROFILE_CACHE_LOCK:
         cached = _PROFILE_CACHE.get(cache_key)
+
         if cached and time.time() - cached[0] < _PROFILE_CACHE_TTL:
             return cached[1]
 
@@ -354,21 +383,36 @@ def get_display_name(source, group_id, user_id, *, force_fetch=False):
     # '내 마딧수'에서는 임시 이름을 보여주지 않도록
     # LINE 프로필을 즉시 한 번 조회합니다.
     if force_fetch:
-        name = _fetch_profile_name(source, group_id, user_id, cache_key)
+        name = _fetch_profile_name(
+            source,
+            group_id,
+            user_id,
+            cache_key,
+        )
+
         if name:
             return name
 
     return fallback_name
 
 
-def schedule_profile_lookup(source, group_id, user_id):
+def schedule_profile_lookup(
+    source,
+    group_id,
+    user_id,
+):
     if not LINE_CHANNEL_ACCESS_TOKEN:
         return
 
-    cache_key = (source.get("type"), group_id, user_id)
+    cache_key = (
+        source.get("type"),
+        group_id,
+        user_id,
+    )
 
     with _PROFILE_CACHE_LOCK:
         cached = _PROFILE_CACHE.get(cache_key)
+
         if cached and time.time() - cached[0] < _PROFILE_CACHE_TTL:
             return
 
@@ -385,9 +429,11 @@ def schedule_profile_lookup(source, group_id, user_id):
             user_id,
             cache_key,
         )
+
     except Exception:
         with _PROFILE_CACHE_LOCK:
             _PROFILE_LOOKUPS_IN_FLIGHT.discard(cache_key)
+
         logger.exception("프로필 조회 작업 예약 실패")
 
 
@@ -405,7 +451,12 @@ def reply_text(reply_token, text):
             headers=line_headers(),
             json={
                 "replyToken": reply_token,
-                "messages": [{"type": "text", "text": str(text)[:4900]}],
+                "messages": [
+                    {
+                        "type": "text",
+                        "text": str(text)[:4900],
+                    }
+                ],
             },
             timeout=(3, 5),
         )
@@ -425,8 +476,13 @@ def reply_text(reply_token, text):
         return False
 
 
-def _member_exists_in_group(source, group_id, user_id):
+def _member_exists_in_group(
+    source,
+    group_id,
+    user_id,
+):
     """현재 LINE 그룹/룸에 실제로 존재하는 사용자인지 확인합니다."""
+
     if not LINE_CHANNEL_ACCESS_TOKEN or not user_id:
         return None
 
@@ -448,8 +504,9 @@ def _member_exists_in_group(source, group_id, user_id):
             )
             return False
 
-        # 403/429/5xx 같은 경우는 실제로 나간 사람인지 확정할 수 없으므로
-        # DB에서 삭제하지 않고 이번 멘션 대상에서만 제외합니다.
+        # 403/429/5xx 같은 경우는 실제로 나간 사람인지
+        # 확정할 수 없으므로 DB에서 삭제하지 않고
+        # 이번 멘션 대상에서만 제외합니다.
         logger.warning(
             "그룹 멤버 확인 실패: status=%s group_id=%s user_id=%s body=%s",
             response.status_code,
@@ -457,6 +514,7 @@ def _member_exists_in_group(source, group_id, user_id):
             user_id,
             response.text[:300],
         )
+
         return None
 
     except requests.RequestException:
@@ -469,21 +527,36 @@ def _member_exists_in_group(source, group_id, user_id):
         return False
 
 
-def get_valid_mention_members(source, group_id, members, *, table_name):
+def get_valid_mention_members(
+    source,
+    group_id,
+    members,
+    *,
+    table_name,
+):
     """DB에는 남아 있지만 현재 방에는 없는 사용자를 멘션에서 제거합니다."""
+
     valid_members = []
     stale_user_ids = []
 
     for member in members:
         user_id = member.get("user_id")
+
         if not user_id:
             continue
 
-        member_status = _member_exists_in_group(source, group_id, user_id)
+        member_status = _member_exists_in_group(
+            source,
+            group_id,
+            user_id,
+        )
+
         if member_status is True:
             valid_members.append(member)
+
         elif member_status is False:
             stale_user_ids.append(user_id)
+
         else:
             # 확인 자체가 실패한 경우에는 DB에서 삭제하지 않습니다.
             # 잘못된 자동 삭제를 막기 위해 이번 요청에서만 멘션 대상에서 제외합니다.
@@ -495,16 +568,19 @@ def get_valid_mention_members(source, group_id, members, *, table_name):
                 db_execute(
                     """
                     DELETE FROM group_admins
-                    WHERE group_id = %s AND user_id = %s
+                    WHERE group_id = %s
+                      AND user_id = %s
                     """,
                     (group_id, user_id),
                 )
+
         elif table_name == "authenticators":
             for user_id in stale_user_ids:
                 db_execute(
                     """
                     DELETE FROM group_authenticators
-                    WHERE group_id = %s AND user_id = %s
+                    WHERE group_id = %s
+                      AND user_id = %s
                     """,
                     (group_id, user_id),
                 )
@@ -519,15 +595,23 @@ def get_valid_mention_members(source, group_id, members, *, table_name):
     return valid_members
 
 
-def reply_mention(reply_token, text, members):
+def reply_mention(
+    reply_token,
+    text,
+    members,
+):
     if not reply_token or not LINE_CHANNEL_ACCESS_TOKEN:
         return False
 
     if not members:
-        return reply_text(reply_token, text)
+        return reply_text(
+            reply_token,
+            text,
+        )
 
     valid_members = [
-        member for member in members
+        member
+        for member in members
         if member.get("user_id")
         and str(member["user_id"]).startswith("U")
     ][:20]
@@ -541,9 +625,16 @@ def reply_mention(reply_token, text, members):
     substitution = {}
     placeholders = []
 
-    for index, member in enumerate(valid_members, start=1):
+    for index, member in enumerate(
+        valid_members,
+        start=1,
+    ):
         key = f"member{index}"
-        placeholders.append("{" + key + "}")
+
+        placeholders.append(
+            "{" + key + "}"
+        )
+
         substitution[key] = {
             "type": "mention",
             "mentionee": {
@@ -552,7 +643,11 @@ def reply_mention(reply_token, text, members):
             },
         }
 
-    message_text = str(text).rstrip() + "\n" + " ".join(placeholders)
+    message_text = (
+        str(text).rstrip()
+        + "\n"
+        + " ".join(placeholders)
+    )
 
     try:
         response = http.post(
@@ -560,11 +655,13 @@ def reply_mention(reply_token, text, members):
             headers=line_headers(),
             json={
                 "replyToken": reply_token,
-                "messages": [{
-                    "type": "textV2",
-                    "text": message_text[:4900],
-                    "substitution": substitution,
-                }],
+                "messages": [
+                    {
+                        "type": "textV2",
+                        "text": message_text[:4900],
+                        "substitution": substitution,
+                    }
+                ],
             },
             timeout=(3, 5),
         )
@@ -588,13 +685,27 @@ def reply_mention(reply_token, text, members):
 # 메시지 기록
 # ==================================================
 
-def record_message(event_id, group_id, user_id, display_name, message_date, character_count):
+def record_message(
+    event_id,
+    group_id,
+    user_id,
+    display_name,
+    message_date,
+    character_count,
+):
     started = time.monotonic()
 
     db_execute(
         """
         INSERT INTO message_events
-            (event_id, group_id, user_id, display_name, message_date, character_count)
+            (
+                event_id,
+                group_id,
+                user_id,
+                display_name,
+                message_date,
+                character_count
+            )
         VALUES (%s, %s, %s, %s, %s, %s)
         ON CONFLICT (event_id) DO NOTHING
         """,
@@ -609,36 +720,59 @@ def record_message(event_id, group_id, user_id, display_name, message_date, char
     )
 
     elapsed = time.monotonic() - started
+
     if elapsed >= 1:
-        logger.warning("메시지 DB 기록 지연: %.2f초", elapsed)
+        logger.warning(
+            "메시지 DB 기록 지연: %.2f초",
+            elapsed,
+        )
 
 
 # ==================================================
 # 인증자
 # ==================================================
 
-def register_authenticator(group_id, user_id, display_name):
+def register_authenticator(
+    group_id,
+    user_id,
+    display_name,
+):
     db_execute(
         """
         INSERT INTO group_authenticators
-            (group_id, user_id, display_name)
+            (
+                group_id,
+                user_id,
+                display_name
+            )
         VALUES (%s, %s, %s)
         ON CONFLICT (group_id, user_id)
         DO UPDATE SET
             display_name = EXCLUDED.display_name,
             registered_at = NOW()
         """,
-        (group_id, user_id, display_name),
+        (
+            group_id,
+            user_id,
+            display_name,
+        ),
     )
 
 
-def unregister_authenticator(group_id, user_id):
+def unregister_authenticator(
+    group_id,
+    user_id,
+):
     return db_execute(
         """
         DELETE FROM group_authenticators
-        WHERE group_id = %s AND user_id = %s
+        WHERE group_id = %s
+          AND user_id = %s
         """,
-        (group_id, user_id),
+        (
+            group_id,
+            user_id,
+        ),
     )
 
 
@@ -659,28 +793,47 @@ def get_authenticators(group_id):
 # 관리자
 # ==================================================
 
-def register_admin(group_id, user_id, display_name):
+def register_admin(
+    group_id,
+    user_id,
+    display_name,
+):
     db_execute(
         """
         INSERT INTO group_admins
-            (group_id, user_id, display_name)
+            (
+                group_id,
+                user_id,
+                display_name
+            )
         VALUES (%s, %s, %s)
         ON CONFLICT (group_id, user_id)
         DO UPDATE SET
             display_name = EXCLUDED.display_name,
             registered_at = NOW()
         """,
-        (group_id, user_id, display_name),
+        (
+            group_id,
+            user_id,
+            display_name,
+        ),
     )
 
 
-def unregister_admin(group_id, user_id):
+def unregister_admin(
+    group_id,
+    user_id,
+):
     return db_execute(
         """
         DELETE FROM group_admins
-        WHERE group_id = %s AND user_id = %s
+        WHERE group_id = %s
+          AND user_id = %s
         """,
-        (group_id, user_id),
+        (
+            group_id,
+            user_id,
+        ),
     )
 
 
@@ -701,14 +854,22 @@ def get_admins(group_id):
 # 마딧수
 # ==================================================
 
-def get_my_stats(group_id, user_id, today, display_name):
+def get_my_stats(
+    group_id,
+    user_id,
+    today,
+    display_name,
+):
     row = db_execute(
         """
         WITH daily_counts AS (
             SELECT
                 user_id,
                 COUNT(*) AS message_count,
-                COALESCE(SUM(character_count), 0) AS character_count
+                COALESCE(
+                    SUM(character_count),
+                    0
+                ) AS character_count
             FROM message_events
             WHERE group_id = %s
               AND message_date = %s
@@ -719,14 +880,23 @@ def get_my_stats(group_id, user_id, today, display_name):
                 user_id,
                 message_count,
                 character_count,
-                RANK() OVER (ORDER BY message_count DESC) AS user_rank
+                RANK() OVER (
+                    ORDER BY message_count DESC
+                ) AS user_rank
             FROM daily_counts
         )
-        SELECT message_count, character_count, user_rank
+        SELECT
+            message_count,
+            character_count,
+            user_rank
         FROM ranked
         WHERE user_id = %s
         """,
-        (group_id, today, user_id),
+        (
+            group_id,
+            today,
+            user_id,
+        ),
         fetchone=True,
     )
 
@@ -735,7 +905,9 @@ def get_my_stats(group_id, user_id, today, display_name):
         chars = row["character_count"]
         rank = row["user_rank"]
     else:
-        count, chars, rank = 0, 0, "-"
+        count = 0
+        chars = 0
+        rank = "-"
 
     return (
         "오늘의 마딧수\n"
@@ -747,7 +919,12 @@ def get_my_stats(group_id, user_id, today, display_name):
     )
 
 
-def get_ranking(group_id, start_date, end_date, title):
+def get_ranking(
+    group_id,
+    start_date,
+    end_date,
+    title,
+):
     rows = db_execute(
         """
         SELECT
@@ -774,9 +951,13 @@ def get_ranking(group_id, start_date, end_date, title):
                     MAX(display_name)
                 )
             ) ASC
-        LIMIT 50
+        LIMIT 100
         """,
-        (group_id, start_date, end_date),
+        (
+            group_id,
+            start_date,
+            end_date,
+        ),
         fetchall=True,
     )
 
@@ -790,7 +971,11 @@ def get_ranking(group_id, start_date, end_date, title):
           AND message_date >= %s
           AND message_date <= %s
         """,
-        (group_id, start_date, end_date),
+        (
+            group_id,
+            start_date,
+            end_date,
+        ),
         fetchone=True,
     )
 
@@ -809,7 +994,11 @@ def get_ranking(group_id, start_date, end_date, title):
         return "\n".join(lines)
 
     lines.append("활동 순위")
-    for rank, row in enumerate(rows, start=1):
+
+    for rank, row in enumerate(
+        rows,
+        start=1,
+    ):
         lines.append(
             f"{rank}위. {row['display_name']} - "
             f"{row['message_count']:,}마디"
@@ -817,9 +1006,10 @@ def get_ranking(group_id, start_date, end_date, title):
 
     lines.extend([
         "",
-        "※ 순위는 최대 50명까지 표시됩니다.",
+        "※ 순위는 최대 100명까지 표시됩니다.",
         "※ 동점자는 표시 순서에 따라 번호가 달라질 수 있습니다.",
     ])
+
     return "\n".join(lines)
 
 
@@ -843,97 +1033,200 @@ EXACT_COMMANDS = {
 }
 
 RANGE_COMMAND_RE = re.compile(
-    r"\*(\d{4}-\d{2}-\d{2})\s*~\s*(\d{4}-\d{2}-\d{2})\s*마딧수"
+    r"\*(\d{4}-\d{2}-\d{2})\s*~\s*"
+    r"(\d{4}-\d{2}-\d{2})\s*마딧수"
 )
 
 
 def is_command(text):
     normalized = text.strip()
+
     return (
         normalized in EXACT_COMMANDS
-        or bool(RANGE_COMMAND_RE.fullmatch(normalized))
+        or bool(
+            RANGE_COMMAND_RE.fullmatch(normalized)
+        )
     )
 
 
-def handle_command(text, source, group_id, user_id, today, display_name, reply_token):
+def handle_command(
+    text,
+    source,
+    group_id,
+    user_id,
+    today,
+    display_name,
+    reply_token,
+):
     if text == "내 마딧수":
-        return get_my_stats(group_id, user_id, today, display_name)
+        return get_my_stats(
+            group_id,
+            user_id,
+            today,
+            display_name,
+        )
 
     if text == "*마딧수":
-        return get_ranking(group_id, today, today, str(today))
+        return get_ranking(
+            group_id,
+            today,
+            today,
+            str(today),
+        )
 
     if text == "인증자 등록":
-        register_authenticator(group_id, user_id, display_name)
-        return f"{display_name}님이 인증자로 등록되었습니다."
+        register_authenticator(
+            group_id,
+            user_id,
+            display_name,
+        )
+
+        return (
+            f"{display_name}님이 "
+            "인증자로 등록되었습니다."
+        )
 
     if text == "인증자 해제":
-        removed = unregister_authenticator(group_id, user_id)
+        removed = unregister_authenticator(
+            group_id,
+            user_id,
+        )
+
         if removed:
-            return f"{display_name}님이 인증자에서 해제되었습니다."
-        return f"{display_name}님은 현재 인증자 명단에 등록되어 있지 않습니다."
+            return (
+                f"{display_name}님이 "
+                "인증자에서 해제되었습니다."
+            )
+
+        return (
+            f"{display_name}님은 현재 "
+            "인증자 명단에 등록되어 있지 않습니다."
+        )
 
     if text == "관리자 등록":
-        register_admin(group_id, user_id, display_name)
-        return f"{display_name}님이 관리자로 등록되었습니다."
+        register_admin(
+            group_id,
+            user_id,
+            display_name,
+        )
+
+        return (
+            f"{display_name}님이 "
+            "관리자로 등록되었습니다."
+        )
 
     if text == "관리자 해제":
-        removed = unregister_admin(group_id, user_id)
+        removed = unregister_admin(
+            group_id,
+            user_id,
+        )
+
         if removed:
-            return f"{display_name}님이 관리자에서 해제되었습니다."
-        return f"{display_name}님은 현재 관리자 명단에 등록되어 있지 않습니다."
+            return (
+                f"{display_name}님이 "
+                "관리자에서 해제되었습니다."
+            )
+
+        return (
+            f"{display_name}님은 현재 "
+            "관리자 명단에 등록되어 있지 않습니다."
+        )
 
     if text in ("*벙시", "*벙종"):
         admins = get_admins(group_id)
+
         if not admins:
             return (
                 "등록된 관리자가 없습니다.\n"
-                "관리자로 등록할 분은 '관리자 등록'을 입력해 주세요."
+                "관리자로 등록할 분은 "
+                "'관리자 등록'을 입력해 주세요."
             )
 
         # 본방을 나간 관리자가 DB에 남아 있어도 전체 멘션이 400으로
         # 실패하지 않도록, 실제 그룹 멤버인지 먼저 확인하고 자동 정리합니다.
         admins = get_valid_mention_members(
-            source, group_id, admins, table_name="admins"
+            source,
+            group_id,
+            admins,
+            table_name="admins",
         )
+
         if not admins:
             return (
                 "현재 방에 있는 등록된 관리자가 없습니다.\n"
-                "관리자로 등록할 분은 '관리자 등록'을 입력해 주세요."
+                "관리자로 등록할 분은 "
+                "'관리자 등록'을 입력해 주세요."
             )
 
-        message_text = "벙시요~" if text == "*벙시" else "벙종이요~"
-        if reply_mention(reply_token, message_text, admins):
+        message_text = (
+            "벙시요~"
+            if text == "*벙시"
+            else "벙종이요~"
+        )
+
+        if reply_mention(
+            reply_token,
+            message_text,
+            admins,
+        ):
             return "__MENTION_SENT__"
+
         return None
 
-    if text in ("*여초", "*남초", "*여초1", "*남초1"):
+    if text in (
+        "*여초",
+        "*남초",
+        "*여초1",
+        "*남초1",
+    ):
         members = get_authenticators(group_id)
+
         if not members:
             return (
                 "등록된 인증자가 없습니다.\n"
-                "인증자로 참여할 분은 '인증자 등록'을 입력해 주세요."
+                "인증자로 참여할 분은 "
+                "'인증자 등록'을 입력해 주세요."
             )
 
         # 본방을 나간 인증자가 DB에 남아 있어도 전체 멘션이 400으로
         # 실패하지 않도록 동일하게 자동 정리합니다.
         members = get_valid_mention_members(
-            source, group_id, members, table_name="authenticators"
+            source,
+            group_id,
+            members,
+            table_name="authenticators",
         )
+
         if not members:
             return (
                 "현재 방에 있는 등록된 인증자가 없습니다.\n"
-                "인증자로 참여할 분은 '인증자 등록'을 입력해 주세요."
+                "인증자로 등록할 분은 "
+                "'인증자 등록'을 입력해 주세요."
             )
 
-        if reply_mention(reply_token, text, members):
+        if reply_mention(
+            reply_token,
+            text,
+            members,
+        ):
             return "__MENTION_SENT__"
+
         return None
 
     match = RANGE_COMMAND_RE.fullmatch(text)
+
     if match:
         try:
-            start_date = datetime.strptime(match.group(1), "%Y-%m-%d").date()
-            end_date = datetime.strptime(match.group(2), "%Y-%m-%d").date()
+            start_date = datetime.strptime(
+                match.group(1),
+                "%Y-%m-%d",
+            ).date()
+
+            end_date = datetime.strptime(
+                match.group(2),
+                "%Y-%m-%d",
+            ).date()
+
         except ValueError:
             return (
                 "날짜 형식이 올바르지 않습니다.\n"
@@ -966,10 +1259,19 @@ def home():
 def health():
     try:
         db_execute("SELECT 1")
-        return jsonify({"status": "ok", "database": "connected"})
+
+        return jsonify({
+            "status": "ok",
+            "database": "connected",
+        })
+
     except Exception:
         logger.exception("헬스 체크 실패")
-        return jsonify({"status": "error", "database": "disconnected"}), 500
+
+        return jsonify({
+            "status": "error",
+            "database": "disconnected",
+        }), 500
 
 
 # ==================================================
@@ -979,10 +1281,15 @@ def health():
 @app.route("/callback", methods=["POST"])
 def callback():
     body = request.get_data()
-    signature = request.headers.get("X-Line-Signature", "")
+    signature = request.headers.get(
+        "X-Line-Signature",
+        "",
+    )
 
     if not LINE_CHANNEL_SECRET:
-        logger.error("LINE_CHANNEL_SECRET이 설정되지 않았습니다.")
+        logger.error(
+            "LINE_CHANNEL_SECRET이 설정되지 않았습니다."
+        )
         abort(500)
 
     digest = hmac.new(
@@ -991,25 +1298,43 @@ def callback():
         hashlib.sha256,
     ).digest()
 
-    expected_signature = base64.b64encode(digest).decode("utf-8")
+    expected_signature = base64.b64encode(
+        digest
+    ).decode("utf-8")
 
-    if not hmac.compare_digest(expected_signature, signature):
-        logger.warning("LINE 웹훅 서명 검증 실패")
+    if not hmac.compare_digest(
+        expected_signature,
+        signature,
+    ):
+        logger.warning(
+            "LINE 웹훅 서명 검증 실패"
+        )
         abort(400)
 
     try:
-        payload = request.get_json(force=True)
+        payload = request.get_json(
+            force=True
+        )
 
-        for event in payload.get("events", []):
+        for event in payload.get(
+            "events",
+            [],
+        ):
             try:
                 process_event(event)
+
             except Exception:
-                logger.exception("LINE 이벤트 처리 실패")
+                logger.exception(
+                    "LINE 이벤트 처리 실패"
+                )
 
         return "OK", 200
 
     except Exception:
-        logger.exception("웹훅 처리 중 오류 발생")
+        logger.exception(
+            "웹훅 처리 중 오류 발생"
+        )
+
         return "ERROR", 500
 
 
@@ -1023,32 +1348,59 @@ def process_event(event):
     if event.get("type") != "message":
         return
 
-    message = event.get("message", {})
+    message = event.get(
+        "message",
+        {},
+    )
+
     if message.get("type") != "text":
         return
 
-    source = event.get("source", {})
+    source = event.get(
+        "source",
+        {},
+    )
+
     source_type = source.get("type")
 
     if source_type == "group":
         group_id = source.get("groupId")
+
     elif source_type == "room":
         group_id = source.get("roomId")
+
     else:
         return
 
     user_id = source.get("userId")
     message_id = message.get("id")
-    raw_text = message.get("text", "")
-    normalized_text = raw_text.strip()
-    reply_token = event.get("replyToken")
+    raw_text = message.get(
+        "text",
+        "",
+    )
 
-    if not group_id or not user_id or not message_id:
-        logger.warning("필수 이벤트 정보가 없어 건너뜁니다.")
+    normalized_text = raw_text.strip()
+    reply_token = event.get(
+        "replyToken"
+    )
+
+    if (
+        not group_id
+        or not user_id
+        or not message_id
+    ):
+        logger.warning(
+            "필수 이벤트 정보가 없어 건너뜁니다."
+        )
         return
 
-    today = datetime.now(KST).date()
-    command = is_command(normalized_text)
+    today = datetime.now(
+        KST
+    ).date()
+
+    command = is_command(
+        normalized_text
+    )
 
     # 핵심 수정:
     # '내 마딧수'는 명령을 처리하기 전에 LINE에서 실제 프로필 이름을
@@ -1060,7 +1412,13 @@ def process_event(event):
         force_fetch=command,
     )
 
-    character_count = len(re.sub(r"\s+", "", raw_text))
+    character_count = len(
+        re.sub(
+            r"\s+",
+            "",
+            raw_text,
+        )
+    )
 
     try:
         record_message(
@@ -1071,6 +1429,7 @@ def process_event(event):
             message_date=today,
             character_count=character_count,
         )
+
     except Exception:
         logger.exception(
             "메시지 기록 실패: group_id=%s user_id=%s",
@@ -1079,11 +1438,23 @@ def process_event(event):
         )
 
     if not command:
-        schedule_profile_lookup(source, group_id, user_id)
+        schedule_profile_lookup(
+            source,
+            group_id,
+            user_id,
+        )
 
-        elapsed = time.monotonic() - started_at
+        elapsed = (
+            time.monotonic()
+            - started_at
+        )
+
         if elapsed >= 1:
-            logger.warning("일반 메시지 처리 지연: %.2f초", elapsed)
+            logger.warning(
+                "일반 메시지 처리 지연: %.2f초",
+                elapsed,
+            )
+
         return
 
     try:
@@ -1097,8 +1468,14 @@ def process_event(event):
             reply_token,
         )
 
-        if reply and reply != "__MENTION_SENT__":
-            reply_text(reply_token, reply)
+        if (
+            reply
+            and reply != "__MENTION_SENT__"
+        ):
+            reply_text(
+                reply_token,
+                reply,
+            )
 
     except Exception:
         logger.exception(
@@ -1106,15 +1483,25 @@ def process_event(event):
             normalized_text,
             group_id,
         )
+
         reply_text(
             reply_token,
-            "일시적으로 명령어 처리에 실패했어요. 잠시 후 다시 시도해 주세요.",
+            "일시적으로 명령어 처리에 실패했어요. "
+            "잠시 후 다시 시도해 주세요.",
         )
 
     finally:
-        schedule_profile_lookup(source, group_id, user_id)
+        schedule_profile_lookup(
+            source,
+            group_id,
+            user_id,
+        )
 
-    elapsed = time.monotonic() - started_at
+    elapsed = (
+        time.monotonic()
+        - started_at
+    )
+
     if elapsed >= 1:
         logger.warning(
             "명령어 처리 지연: %.2f초, 명령어=%r",
@@ -1126,10 +1513,18 @@ def process_event(event):
 if __name__ == "__main__":
     try:
         init_database()
+
     except Exception:
-        logger.exception("시작 시 DB 초기화 실패")
+        logger.exception(
+            "시작 시 DB 초기화 실패"
+        )
 
     app.run(
         host="0.0.0.0",
-        port=int(os.getenv("PORT", "10000")),
+        port=int(
+            os.getenv(
+                "PORT",
+                "10000",
+            )
+        ),
     )
