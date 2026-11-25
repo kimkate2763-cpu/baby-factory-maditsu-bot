@@ -66,10 +66,6 @@ GEMINI_MODEL = os.getenv(
     "gemini-3.8-flash",
 ).strip()
 
-# 선택사항:
-# Render 환경변수 GEMINI_MODELS에
-# gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash-lite
-# 처럼 넣으면 이 목록을 우선 사용한다.
 GEMINI_MODELS_ENV = os.getenv(
     "GEMINI_MODELS",
     "",
@@ -155,6 +151,614 @@ http.mount(
 
 
 # =========================================================
+# 날씨 API 설정
+# Open-Meteo 사용
+# 별도 API KEY 필요 없음
+# =========================================================
+
+WEATHER_GEOCODING_URL = (
+    "https://geocoding-api.open-meteo.com/v1/search"
+)
+
+WEATHER_FORECAST_URL = (
+    "https://api.open-meteo.com/v1/forecast"
+)
+
+WEATHER_CONNECT_TIMEOUT = 2.0
+
+WEATHER_READ_TIMEOUT = 5.0
+
+
+WEATHER_CODES = {
+    0: "맑음 ☀️",
+    1: "대체로 맑음 🌤️",
+    2: "부분적으로 흐림 ⛅",
+    3: "흐림 ☁️",
+    45: "안개 🌫️",
+    48: "안개 🌫️",
+    51: "약한 이슬비 🌦️",
+    53: "이슬비 🌦️",
+    55: "강한 이슬비 🌧️",
+    56: "어는 이슬비 🌧️",
+    57: "강한 어는 이슬비 🌧️",
+    61: "약한 비 🌧️",
+    63: "비 🌧️",
+    65: "강한 비 🌧️",
+    66: "어는 비 🌧️",
+    67: "강한 어는 비 🌧️",
+    71: "약한 눈 🌨️",
+    73: "눈 ❄️",
+    75: "강한 눈 ❄️",
+    77: "싸락눈 🌨️",
+    80: "약한 소나기 🌦️",
+    81: "소나기 🌧️",
+    82: "강한 소나기 🌧️",
+    85: "약한 눈소나기 🌨️",
+    86: "강한 눈소나기 ❄️",
+    95: "천둥번개 ⛈️",
+    96: "천둥번개 + 우박 ⛈️",
+    97: "강한 천둥번개 ⛈️",
+    99: "강한 천둥번개 + 우박 ⛈️",
+}
+
+
+# =========================================================
+# 날씨 지역명 추출
+# =========================================================
+
+def extract_weather_location(question):
+    """
+    예:
+    오늘 혜화 근처 날씨 알려줘
+    -> 혜화
+
+    내일 서울 날씨
+    -> 서울
+
+    오늘 날씨 어때?
+    -> None
+    """
+
+    text = question.strip()
+
+    # 날짜 표현 제거
+    text = re.sub(
+        r"(오늘|내일|모레|지금|현재)",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # 날씨 관련 표현 제거
+    text = re.sub(
+        r"(날씨|기온|온도|강수량|강수|비|눈|"
+        r"알려줘|알려 줘|어때|어때\?|궁금해|"
+        r"몇 도|몇도)",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # 위치 관련 표현 제거
+    text = re.sub(
+        r"(근처|주변|쪽|지역|에서|의|에|은|는|이|가)",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # 문장부호 제거
+    text = re.sub(
+        r"[?!.,~]+",
+        " ",
+        text,
+    )
+
+    # 공백 정리
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    ).strip()
+
+    if not text:
+        return None
+
+    if len(text) > 40:
+        return None
+
+    return text
+
+
+# =========================================================
+# 날씨 지역 검색
+# =========================================================
+
+def get_weather_location(
+    location_text,
+):
+
+    if not location_text:
+        return None
+
+    response = http.get(
+        WEATHER_GEOCODING_URL,
+        params={
+            "name": location_text,
+            "count": 5,
+            "language": "ko",
+            "format": "json",
+            "countryCode": "KR",
+        },
+        timeout=(
+            WEATHER_CONNECT_TIMEOUT,
+            WEATHER_READ_TIMEOUT,
+        ),
+    )
+
+    if response.status_code != 200:
+
+        raise RuntimeError(
+            "날씨 지역 검색 실패: "
+            f"HTTP {response.status_code}"
+        )
+
+    data = response.json()
+
+    results = data.get(
+        "results"
+    ) or []
+
+    if not results:
+        return None
+
+    # 한국 결과 우선
+    selected = None
+
+    for result in results:
+
+        country_code = str(
+            result.get(
+                "country_code",
+                ""
+            )
+        ).upper()
+
+        if country_code == "KR":
+
+            selected = result
+            break
+
+    if selected is None:
+        selected = results[0]
+
+    return {
+        "name": selected.get(
+            "name"
+        ) or location_text,
+        "admin1": selected.get(
+            "admin1"
+        ) or "",
+        "latitude": selected.get(
+            "latitude"
+        ),
+        "longitude": selected.get(
+            "longitude"
+        ),
+        "timezone": selected.get(
+            "timezone"
+        ) or "Asia/Seoul",
+    }
+
+
+# =========================================================
+# 날씨 데이터 조회
+# =========================================================
+
+def get_weather_data(
+    location,
+):
+
+    response = http.get(
+        WEATHER_FORECAST_URL,
+        params={
+            "latitude": location["latitude"],
+            "longitude": location["longitude"],
+            "current": (
+                "temperature_2m,"
+                "apparent_temperature,"
+                "relative_humidity_2m,"
+                "weather_code,"
+                "wind_speed_10m"
+            ),
+            "daily": (
+                "weather_code,"
+                "temperature_2m_max,"
+                "temperature_2m_min,"
+                "apparent_temperature_max,"
+                "apparent_temperature_min,"
+                "precipitation_probability_max,"
+                "precipitation_sum,"
+                "sunrise,"
+                "sunset"
+            ),
+            "timezone": location.get(
+                "timezone",
+                "Asia/Seoul",
+            ),
+            "forecast_days": 3,
+        },
+        timeout=(
+            WEATHER_CONNECT_TIMEOUT,
+            WEATHER_READ_TIMEOUT,
+        ),
+    )
+
+    if response.status_code != 200:
+
+        raise RuntimeError(
+            "날씨 조회 실패: "
+            f"HTTP {response.status_code}"
+        )
+
+    data = response.json()
+
+    if data.get("error"):
+
+        raise RuntimeError(
+            data.get(
+                "reason",
+                "날씨 API 오류",
+            )
+        )
+
+    return data
+
+
+# =========================================================
+# 날씨 날짜 판단
+# =========================================================
+
+def get_weather_target_day(
+    question,
+):
+
+    text = question.lower()
+
+    if "모레" in text:
+        return 2
+
+    if "내일" in text:
+        return 1
+
+    return 0
+
+
+# =========================================================
+# 날씨 결과 포맷
+# =========================================================
+
+def format_weather_answer(
+    location,
+    weather,
+    target_day,
+):
+
+    daily = weather.get(
+        "daily"
+    ) or {}
+
+    dates = daily.get(
+        "time"
+    ) or []
+
+    codes = daily.get(
+        "weather_code"
+    ) or []
+
+    max_temps = daily.get(
+        "temperature_2m_max"
+    ) or []
+
+    min_temps = daily.get(
+        "temperature_2m_min"
+    ) or []
+
+    apparent_max = daily.get(
+        "apparent_temperature_max"
+    ) or []
+
+    apparent_min = daily.get(
+        "apparent_temperature_min"
+    ) or []
+
+    rain_probs = daily.get(
+        "precipitation_probability_max"
+    ) or []
+
+    precipitation = daily.get(
+        "precipitation_sum"
+    ) or []
+
+    sunrise = daily.get(
+        "sunrise"
+    ) or []
+
+    sunset = daily.get(
+        "sunset"
+    ) or []
+
+    if not dates:
+        raise RuntimeError(
+            "날씨 일별 데이터가 없습니다."
+        )
+
+    if target_day >= len(dates):
+
+        target_day = 0
+
+    date_text = dates[target_day]
+
+    code = (
+        codes[target_day]
+        if target_day < len(codes)
+        else None
+    )
+
+    try:
+
+        weather_code = int(code)
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+
+        weather_code = -1
+
+    condition = WEATHER_CODES.get(
+        weather_code,
+        "날씨 정보 확인 필요 🌥️",
+    )
+
+    max_temp = (
+        max_temps[target_day]
+        if target_day < len(max_temps)
+        else None
+    )
+
+    min_temp = (
+        min_temps[target_day]
+        if target_day < len(min_temps)
+        else None
+    )
+
+    apparent_high = (
+        apparent_max[target_day]
+        if target_day < len(apparent_max)
+        else None
+    )
+
+    apparent_low = (
+        apparent_min[target_day]
+        if target_day < len(apparent_min)
+        else None
+    )
+
+    rain_probability = (
+        rain_probs[target_day]
+        if target_day < len(rain_probs)
+        else None
+    )
+
+    precipitation_amount = (
+        precipitation[target_day]
+        if target_day < len(precipitation)
+        else None
+    )
+
+    day_names = {
+        0: "오늘",
+        1: "내일",
+        2: "모레",
+    }
+
+    day_label = day_names.get(
+        target_day,
+        "오늘",
+    )
+
+    lines = [
+        f"🧸 {location['name']} {day_label} 날씨",
+        f"📅 {date_text}",
+        f"🌤️ {condition}",
+    ]
+
+    if (
+        min_temp is not None
+        and max_temp is not None
+    ):
+
+        lines.append(
+            f"🌡️ 기온 "
+            f"{float(min_temp):.0f}°C ~ "
+            f"{float(max_temp):.0f}°C"
+        )
+
+    if (
+        apparent_low is not None
+        and apparent_high is not None
+    ):
+
+        lines.append(
+            f"🥶 체감 "
+            f"{float(apparent_low):.0f}°C ~ "
+            f"{float(apparent_high):.0f}°C"
+        )
+
+    if rain_probability is not None:
+
+        lines.append(
+            f"☔ 강수확률 최대 "
+            f"{float(rain_probability):.0f}%"
+        )
+
+    if precipitation_amount is not None:
+
+        lines.append(
+            f"💧 예상 강수량 "
+            f"{float(precipitation_amount):.1f}mm"
+        )
+
+    # 오늘인 경우 현재 날씨 추가
+    if (
+        target_day == 0
+        and weather.get("current")
+    ):
+
+        current = weather[
+            "current"
+        ]
+
+        current_temp = current.get(
+            "temperature_2m"
+        )
+
+        current_apparent = current.get(
+            "apparent_temperature"
+        )
+
+        current_humidity = current.get(
+            "relative_humidity_2m"
+        )
+
+        current_wind = current.get(
+            "wind_speed_10m"
+        )
+
+        if current_temp is not None:
+
+            lines.append(
+                f"🌡️ 현재 "
+                f"{float(current_temp):.1f}°C"
+            )
+
+        if current_apparent is not None:
+
+            lines.append(
+                f"🧣 현재 체감 "
+                f"{float(current_apparent):.1f}°C"
+            )
+
+        if current_humidity is not None:
+
+            lines.append(
+                f"💦 습도 "
+                f"{float(current_humidity):.0f}%"
+            )
+
+        if current_wind is not None:
+
+            lines.append(
+                f"💨 바람 "
+                f"{float(current_wind):.0f}km/h"
+            )
+
+    if (
+        target_day < len(sunrise)
+        and target_day < len(sunset)
+    ):
+
+        sunrise_text = str(
+            sunrise[target_day]
+        )[-5:]
+
+        sunset_text = str(
+            sunset[target_day]
+        )[-5:]
+
+        lines.append(
+            f"🌅 일출 {sunrise_text} · "
+            f"일몰 {sunset_text}"
+        )
+
+    lines.append("")
+
+    lines.append(
+        "🧸 장난감 가게 기상대에서 확인했어!"
+    )
+
+    return "\n".join(
+        lines
+    )[:4900]
+
+
+# =========================================================
+# 날씨 질문 처리
+# =========================================================
+
+def ask_weather(
+    question,
+):
+
+    location_text = extract_weather_location(
+        question
+    )
+
+    if not location_text:
+
+        return (
+            "어디 날씨를 볼까? 🧸☁️\n"
+            "지역을 같이 적어줘!\n"
+            "예: !오늘 혜화 근처 날씨 알려줘"
+        )
+
+    try:
+
+        location = get_weather_location(
+            location_text
+        )
+
+        if not location:
+
+            return (
+                f"앗, '{location_text}' 지역을 "
+                "찾지 못했어 🧸💦\n"
+                "조금 더 정확한 지역명을 적어줘!"
+            )
+
+        weather = get_weather_data(
+            location
+        )
+
+        target_day = get_weather_target_day(
+            question
+        )
+
+        return format_weather_answer(
+            location,
+            weather,
+            target_day,
+        )
+
+    except Exception as exc:
+
+        logger.warning(
+            "날씨 조회 실패: "
+            "location=%r error=%s",
+            location_text,
+            exc,
+            exc_info=True,
+        )
+
+        return (
+            "앗... 장난감 가게 기상대가 "
+            "잠깐 삐끗했어 🧸🌧️\n"
+            "조금 있다가 다시 물어봐줘!"
+        )
+
+
+# =========================================================
 # DB 설정
 # =========================================================
 
@@ -223,14 +827,17 @@ def _connect_db_locked():
     )
 
     conn.execute(
-        f"SET statement_timeout = '{DB_STATEMENT_TIMEOUT}ms'"
+        f"SET statement_timeout = "
+        f"'{DB_STATEMENT_TIMEOUT}ms'"
     )
 
     conn.commit()
 
     _db_connection = conn
 
-    _db_connection_created_at = time.monotonic()
+    _db_connection_created_at = (
+        time.monotonic()
+    )
 
     logger.info(
         "DB 연결 생성 완료"
@@ -280,7 +887,9 @@ def _get_connection_locked():
 # DB 연결 오류 판별
 # =========================================================
 
-def _is_connection_error(exc):
+def _is_connection_error(
+    exc,
+):
 
     if isinstance(
         exc,
@@ -505,7 +1114,9 @@ def db_execute(
                     except Exception:
                         pass
 
-                    if _is_connection_error(exc):
+                    if _is_connection_error(
+                        exc
+                    ):
 
                         logger.warning(
                             "DB 연결 오류. "
@@ -529,7 +1140,9 @@ def db_execute(
 
             if (
                 attempt == 0
-                and _is_connection_error(exc)
+                and _is_connection_error(
+                    exc
+                )
             ):
 
                 time.sleep(0.2)
@@ -543,6 +1156,7 @@ def db_execute(
             time.sleep(0.2)
 
     if last_error is not None:
+
         raise last_error
 
     raise RuntimeError(
@@ -1112,7 +1726,6 @@ def _member_exists_in_group(
 
     except requests.RequestException:
 
-        # 네트워크 오류는 탈퇴로 간주하지 않는다.
         return None
 
 
@@ -1760,7 +2373,9 @@ def get_weekly_ranking(
             "이번 주 월요일부터 다시 집계됩니다.",
         ])
 
-        return "\n".join(lines)
+        return "\n".join(
+            lines
+        )
 
     for rank, row in enumerate(
         rows,
@@ -1800,7 +2415,9 @@ def get_weekly_ranking(
         "※ 순위는 최대 100명까지 표시됩니다.",
     ])
 
-    return "\n".join(lines)
+    return "\n".join(
+        lines
+    )
 
 
 # =========================================================
@@ -2006,7 +2623,9 @@ def get_ranking(
             "봇이 들어온 뒤 기록된 메시지부터 집계됩니다.",
         ])
 
-        return "\n".join(lines)
+        return "\n".join(
+            lines
+        )
 
     for rank, row in enumerate(
         rows,
@@ -2025,7 +2644,9 @@ def get_ranking(
         "※ 동점자는 표시 순서에 따라 번호가 달라질 수 있습니다.",
     ])
 
-    return "\n".join(lines)
+    return "\n".join(
+        lines
+    )
 
 
 # =========================================================
@@ -2077,12 +2698,6 @@ def gemini_needs_search(
 ):
 
     keywords = (
-        "날씨",
-        "오늘",
-        "내일",
-        "모레",
-        "현재",
-        "지금",
         "최신",
         "최근",
         "뉴스",
@@ -2206,10 +2821,12 @@ def mark_gemini_success(
             model
         ] = now
 
-        _gemini_last_preferred_probe = now
+        # 실제로 기본 모델이 성공한 경우에만
+        # 기본 모델 재시도 타이머를 갱신한다.
+        if model == get_configured_gemini_models()[0]:
 
-    # DB 저장은 별도 스레드에서 처리해서
-    # Gemini 응답을 늦추지 않는다.
+            _gemini_last_preferred_probe = now
+
     try:
 
         threading.Thread(
@@ -2398,7 +3015,7 @@ def get_gemini_model_order():
 
 
 # =========================================================
-# Gemini GenerateContent 응답 추출
+# Gemini 응답 추출
 # =========================================================
 
 def extract_generate_content_text(
@@ -2608,15 +3225,6 @@ def ask_gemini(
     user_text,
 ):
 
-    if not GEMINI_API_KEY:
-
-        return (
-            "앗! 아직 내 장난감 두뇌에 "
-            "전원이 안 들어왔어 🧸\n"
-            "관리자가 Gemini API 키를 설정해주면 "
-            "다시 깨어날 수 있어!"
-        )
-
     question = user_text.strip()
 
     if question.startswith("!"):
@@ -2631,6 +3239,49 @@ def ask_gemini(
             "응? 나 불렀어? 🧸\n"
             "뒤에 궁금한 걸 적어줘!\n"
             "예: !점메추"
+        )
+
+    # =====================================================
+    # 중요:
+    # 날씨는 Gemini API보다 먼저 직접 처리한다.
+    # 따라서 GEMINI_API_KEY가 없어도 날씨는 작동한다.
+    # =====================================================
+
+    weather_keywords = (
+        "날씨",
+        "기온",
+        "온도",
+        "강수",
+        "비 올",
+        "비와",
+        "비 와",
+        "눈 올",
+        "눈와",
+        "눈 와",
+        "몇 도",
+        "몇도",
+    )
+
+    if any(
+        keyword in question.lower()
+        for keyword in weather_keywords
+    ):
+
+        return ask_weather(
+            question
+        )
+
+    # =====================================================
+    # 일반 AI
+    # =====================================================
+
+    if not GEMINI_API_KEY:
+
+        return (
+            "앗! 아직 내 장난감 두뇌에 "
+            "전원이 안 들어왔어 🧸\n"
+            "관리자가 Gemini API 키를 설정해주면 "
+            "다시 깨어날 수 있어!"
         )
 
     use_search = gemini_needs_search(
@@ -2839,7 +3490,7 @@ def handle_command(
 ):
 
     # -----------------------------------------------------
-    # Gemini
+    # Gemini / 날씨
     # -----------------------------------------------------
 
     if is_ai_command(text):
@@ -3166,11 +3817,6 @@ def health():
             exc_info=True,
         )
 
-    # 중요:
-    # Render의 서비스 생존 여부와
-    # DB 상태를 분리한다.
-    #
-    # DB가 잠깐 끊겨도 /health는 200을 반환한다.
     return jsonify({
         "status": "ok",
         "database": (
@@ -3287,11 +3933,14 @@ def parse_line_json(
 )
 def callback():
 
-    # request.get_json()을 사용하지 않는다.
-    # 빈 body / 비정상 JSON 때문에
-    # Flask JSONDecodeError가 발생하는 것을 방지한다.
+    # 중요:
+    # cache=False로 body를 읽고 다시 get_json()을 호출하면
+    # 이미 body가 소비되어 JSONDecodeError가 발생할 수 있다.
+    #
+    # 따라서 raw body를 cache=True로 읽고
+    # 직접 json.loads() 한다.
     body = request.get_data(
-        cache=False
+        cache=True
     )
 
     signature = request.headers.get(
@@ -3314,8 +3963,8 @@ def callback():
         body
     )
 
-    # JSON이 비어 있거나 이상해도
-    # webhook 자체는 200으로 종료한다.
+    # 빈 body 또는 JSON 파싱 실패는
+    # webhook 자체를 죽이지 않는다.
     if payload is None:
 
         return "OK", 200
