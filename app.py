@@ -65,18 +65,22 @@ DEFAULT_GEMINI_MODELS = [
     "gemini-3.5-flash-lite",
 ]
 
-GEMINI_FAILURE_COOLDOWN = 60
+GEMINI_FAILURE_COOLDOWN = 90
+GEMINI_QUOTA_COOLDOWN = 300
+GEMINI_TRANSIENT_RETRIES = 2
+GEMINI_RETRY_BASE_DELAY = 0.8
 
 # 너무 짧으면 네트워크가 조금만 느려도 실패할 수 있어서 여유 있게 설정
-GEMINI_CONNECT_TIMEOUT = 2.5
-GEMINI_READ_TIMEOUT = 15.0
+GEMINI_CONNECT_TIMEOUT = 4.0
+GEMINI_READ_TIMEOUT = 20.0
 
 # Gemini가 답변을 너무 짧게 끊지 않도록 충분히 확보
-GEMINI_MAX_OUTPUT_TOKENS = 900
+GEMINI_MAX_OUTPUT_TOKENS = 1200
 
 
 _gemini_lock = threading.RLock()
 _gemini_failed_until = {}
+_gemini_quota_failed_until = 0.0
 
 
 # =========================================================
@@ -636,7 +640,7 @@ def get_display_name(
         if (
             cached
             and time.time() - cached[0]
-            < 600
+            < _PROFILE_CACHE_TTL
             and not force_fetch
         ):
             return cached[1]
@@ -695,7 +699,7 @@ def schedule_profile_lookup(
         if (
             cached
             and time.time() - cached[0]
-            < 600
+            < _PROFILE_CACHE_TTL
         ):
             return
 
@@ -730,23 +734,16 @@ def reply_text(
     reply_token,
     text
 ):
-
-    if (
-        not reply_token
-        or not LINE_CHANNEL_ACCESS_TOKEN
-    ):
+    if not reply_token or not LINE_CHANNEL_ACCESS_TOKEN:
         return False
 
     text = str(text).strip()
-
     if not text:
         return False
 
-    # LINE 일반 텍스트 안전 길이
-    text = text[:4900]
+    text = _trim_to_complete_sentence(text, 4900)
 
     try:
-
         response = http.post(
             "https://api.line.me/v2/bot/message/reply",
             headers=line_headers(),
@@ -759,27 +756,21 @@ def reply_text(
                     }
                 ]
             },
-            timeout=(2.5, 7.0)
+            timeout=(2.5, 8.0)
         )
 
-        if not response.ok:
+        if response.ok:
+            return True
 
-            logger.error(
-                "LINE 답장 실패: %s %s",
-                response.status_code,
-                response.text[:500]
-            )
-
-            return False
-
-        return True
+        logger.error(
+            "LINE 답장 실패: %s %s",
+            response.status_code,
+            response.text[:500]
+        )
+        return False
 
     except Exception:
-
-        logger.exception(
-            "LINE 답장 전송 오류"
-        )
-
+        logger.exception("LINE 답장 전송 오류")
         return False
 
 
@@ -2401,89 +2392,131 @@ def looks_incomplete(text):
 
 
 # =========================================================
-# Gemini 실패 관리
+# Gemini 실패 / 재시도 관리
 # =========================================================
 
-def mark_gemini_failure(
-    model
-):
-
+def mark_gemini_failure(model, cooldown=None):
     with _gemini_lock:
-
-        _gemini_failed_until[
-            model
-        ] = (
-            time.time()
-            + GEMINI_FAILURE_COOLDOWN
+        _gemini_failed_until[model] = (
+            time.time() + (cooldown or GEMINI_FAILURE_COOLDOWN)
         )
 
 
+def mark_gemini_quota_failure(cooldown=GEMINI_QUOTA_COOLDOWN):
+    global _gemini_quota_failed_until
+    with _gemini_lock:
+        _gemini_quota_failed_until = time.time() + cooldown
+
+
+def gemini_quota_on_cooldown():
+    with _gemini_lock:
+        return time.time() < _gemini_quota_failed_until
+
+
 def get_gemini_model_order():
-
-    models = (
-        get_configured_gemini_models()
-    )
-
+    models = get_configured_gemini_models()
     now = time.time()
 
     with _gemini_lock:
-
         available = [
-            model
-            for model in models
-            if _gemini_failed_until.get(
-                model,
-                0
-            ) <= now
+            model for model in models
+            if _gemini_failed_until.get(model, 0) <= now
         ]
 
     return available or models
+
+
+def _gemini_error_kind(status_code, response_text):
+    text = (response_text or "").lower()
+
+    if status_code == 429:
+        quota_words = (
+            "quota",
+            "free_tier",
+            "resource_exhausted",
+            "daily limit",
+            "rate limit",
+            "rate_limit",
+            "limit: 0",
+        )
+        if any(word in text for word in quota_words):
+            return "quota"
+        return "rate_limit"
+
+    if status_code in (408, 500, 502, 503, 504):
+        return "transient"
+
+    return "fatal"
+
+
+def _retry_after_seconds(response):
+    value = response.headers.get("Retry-After")
+    if not value:
+        return None
+
+    try:
+        seconds = float(value)
+        return max(0.0, min(seconds, 8.0))
+    except (TypeError, ValueError):
+        return None
 
 
 # =========================================================
 # Gemini 응답 추출
 # =========================================================
 
-def extract_generate_content_text(
-    data
-):
-
+def extract_generate_content_text(data):
     output = []
 
-    candidates = (
-        data.get("candidates")
-        or []
-    )
-
-    for candidate in candidates:
-
-        content = (
-            candidate.get("content")
-            or {}
-        )
-
-        parts = (
-            content.get("parts")
-            or []
-        )
-
-        for part in parts:
-
+    for candidate in (data.get("candidates") or []):
+        content = candidate.get("content") or {}
+        for part in (content.get("parts") or []):
             if (
                 not part.get("thought")
-                and isinstance(
-                    part.get("text"),
-                    str
-                )
+                and isinstance(part.get("text"), str)
             ):
+                output.append(part["text"])
 
-                output.append(
-                    part["text"]
-                )
+    return "\n".join(output).strip()
 
-    return "\n".join(
-        output
-    ).strip()
+
+def extract_finish_reason(data):
+    candidates = data.get("candidates") or []
+    if not candidates:
+        return None
+    return candidates[0].get("finishReason")
+
+
+def _trim_to_complete_sentence(text, max_chars=4900):
+    text = clean_ai_response(text)
+
+    if len(text) <= max_chars:
+        return text
+
+    cut = text[:max_chars].rstrip()
+
+    # 마지막 문장 부호 위치를 우선한다.
+    positions = [
+        cut.rfind("。"),
+        cut.rfind("."),
+        cut.rfind("!"),
+        cut.rfind("?"),
+        cut.rfind("！"),
+        cut.rfind("？"),
+        cut.rfind("다."),
+        cut.rfind("요."),
+    ]
+    last = max(positions)
+
+    if last >= 200:
+        return cut[:last + 1].rstrip()
+
+    # 문장 부호가 없으면 마지막 줄 단위로 자른다.
+    newline = cut.rfind("\n")
+    if newline >= 200:
+        return cut[:newline].rstrip()
+
+    return cut.rstrip()
 
 
 # =========================================================
@@ -2495,11 +2528,8 @@ def call_gemini_model(
     question,
     use_search=False
 ):
-
     if not GEMINI_API_KEY:
-        raise RuntimeError(
-            "GEMINI_API_KEY가 없습니다."
-        )
+        raise RuntimeError("GEMINI_API_KEY가 없습니다.")
 
     prompt = (
         AI_SYSTEM_PROMPT
@@ -2509,133 +2539,130 @@ def call_gemini_model(
         + "\n\n"
         + "[답변 지시]\n"
         + "질문의 핵심에 바로 답해. "
-        + "답변을 완전한 문장으로 끝내. "
-        + "중간에 끊지 마."
+        + "필요한 내용은 끝까지 설명하되 불필요하게 길게 늘이지 마. "
+        + "완전한 문장으로 자연스럽게 끝내."
     )
 
     payload = {
-
         "contents": [
             {
                 "role": "user",
-                "parts": [
-                    {
-                        "text": prompt
-                    }
-                ]
+                "parts": [{"text": prompt}]
             }
         ],
-
         "generationConfig": {
-            "maxOutputTokens":
-                GEMINI_MAX_OUTPUT_TOKENS,
-
+            "maxOutputTokens": GEMINI_MAX_OUTPUT_TOKENS,
             "temperature": 0.7,
         }
     }
 
+    # 현재는 비용/오류 최소화를 위해 자동 검색을 사용하지 않는다.
     if use_search:
-
-        payload["tools"] = [
-            {
-                "google_search": {}
-            }
-        ]
+        payload["tools"] = [{"google_search": {}}]
 
     url = (
         "https://generativelanguage.googleapis.com/"
         f"v1beta/models/{model}:generateContent"
     )
 
-    response = http.post(
+    last_exc = None
 
-        url,
+    for attempt in range(GEMINI_TRANSIENT_RETRIES + 1):
+        try:
+            response = http.post(
+                url,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": GEMINI_API_KEY,
+                },
+                json=payload,
+                timeout=(
+                    GEMINI_CONNECT_TIMEOUT,
+                    GEMINI_READ_TIMEOUT
+                )
+            )
 
-        headers={
-            "Content-Type":
-                "application/json",
+            if response.status_code == 200:
+                data = response.json()
+                text = extract_generate_content_text(data)
 
-            "x-goog-api-key":
-                GEMINI_API_KEY,
-        },
+                if not text:
+                    raise RuntimeError(
+                        "Gemini 응답에 텍스트가 없습니다."
+                    )
 
-        json=payload,
+                return {
+                    "text": clean_ai_response(text),
+                    "finish_reason": extract_finish_reason(data),
+                }
 
-        timeout=(
-            GEMINI_CONNECT_TIMEOUT,
-            GEMINI_READ_TIMEOUT
-        )
-    )
+            body = response.text[:1200]
+            kind = _gemini_error_kind(
+                response.status_code,
+                body
+            )
 
-    if response.status_code != 200:
+            if kind == "quota":
+                raise RuntimeError(
+                    f"QUOTA_429: {body}"
+                )
 
-        raise RuntimeError(
-            f"HTTP {response.status_code}: "
-            f"{response.text[:700]}"
-        )
+            if kind == "rate_limit":
+                retry_after = _retry_after_seconds(response)
+                if retry_after is None:
+                    retry_after = GEMINI_RETRY_BASE_DELAY * (2 ** attempt)
 
-    data = response.json()
+                if attempt < GEMINI_TRANSIENT_RETRIES:
+                    time.sleep(retry_after)
+                    continue
 
-    text = extract_generate_content_text(
-        data
-    )
+                raise RuntimeError(
+                    f"RATE_LIMIT_429: {body}"
+                )
 
-    if not text:
+            if kind == "transient":
+                if attempt < GEMINI_TRANSIENT_RETRIES:
+                    delay = GEMINI_RETRY_BASE_DELAY * (2 ** attempt)
+                    time.sleep(delay)
+                    continue
 
-        raise RuntimeError(
-            "Gemini 응답에 텍스트가 없습니다."
-        )
+                raise RuntimeError(
+                    f"TRANSIENT_{response.status_code}: {body}"
+                )
 
-    return clean_ai_response(
-        text
-    )
+            raise RuntimeError(
+                f"HTTP {response.status_code}: {body}"
+            )
 
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_exc = exc
 
-# =========================================================
-# Gemini 검색 필요 여부
-# =========================================================
+            if attempt < GEMINI_TRANSIENT_RETRIES:
+                time.sleep(
+                    GEMINI_RETRY_BASE_DELAY * (2 ** attempt)
+                )
+                continue
 
-def gemini_needs_search(text):
+            raise RuntimeError(
+                f"NETWORK_ERROR: {exc}"
+            ) from exc
 
-    lower = text.lower()
+        except RuntimeError as exc:
+            last_exc = exc
+            raise
 
-    keywords = (
-        "최신",
-        "최근",
-        "뉴스",
-        "가격",
-        "영업시간",
-        "맛집",
-        "식당",
-        "카페",
-        "예약",
-        "예매",
-        "주가",
-        "주식",
-        "환율",
-        "여행",
-        "축제",
-        "공연",
-        "이벤트",
-        "현재",
-        "오늘",
-        "내일",
-    )
+        except Exception as exc:
+            last_exc = exc
+            raise
 
-    return any(
-        keyword in lower
-        for keyword in keywords
-    )
+    raise last_exc or RuntimeError("Gemini 호출 실패")
 
 
 # =========================================================
 # Gemini 답변
 # =========================================================
 
-def ask_gemini(
-    user_text
-):
-
+def ask_gemini(user_text):
     raw = user_text.strip()
 
     question = (
@@ -2645,7 +2672,6 @@ def ask_gemini(
     )
 
     if not question:
-
         return (
             "응? 나 불렀어? 🥄\n"
             "뒤에 궁금한 걸 적어줘!\n"
@@ -2653,121 +2679,141 @@ def ask_gemini(
         )
 
     # 날씨는 Gemini를 거치지 않는다.
-    # 이게 날씨 오류를 줄이는 핵심.
-    if is_weather_query(
-        question
-    ):
-
-        return get_weather_answer(
-            question
-        )
+    if is_weather_query(question):
+        return get_weather_answer(question)
 
     if not GEMINI_API_KEY:
-
         return (
             "어라... 내 장난감 두뇌에 "
             "아직 전원이 안 들어왔어 🥄💦\n"
             "관리자에게 알려줘!"
         )
 
-    use_search = (
-        gemini_needs_search(
-            question
+    # 프로젝트 전체가 quota cooldown 중이면 모델을 계속 두드리지 않는다.
+    if gemini_quota_on_cooldown():
+        logger.warning("Gemini 프로젝트 quota cooldown 중")
+        return (
+            "어... 지금 내 장난감 두뇌 쪽 사용량 제한에 걸렸어 🥄💦\n"
+            "잠깐 뒤에 다시 불러줘!"
         )
-    )
 
-    models = (
-        get_gemini_model_order()
-    )
-
+    use_search = False
+    models = get_gemini_model_order()
     errors = []
 
+    # 정상적인 경우 첫 모델 하나만 사용한다.
+    # 오류가 날 때만 다음 모델로 넘어간다.
     for model in models:
-
         try:
-
-            answer = call_gemini_model(
+            result = call_gemini_model(
                 model,
                 question,
                 use_search
             )
 
-            # 지나치게 비정상적인 빈 답변 방지
+            answer = result.get("text", "")
+            finish_reason = result.get("finish_reason")
+
             if not answer:
-                raise RuntimeError(
-                    "빈 답변"
-                )
+                raise RuntimeError("빈 답변")
 
-            # 미완성처럼 보이는 답변은
-            # 일단 정상 답변으로 보내지 않는다.
-            if looks_incomplete(answer):
-
-                logger.warning(
-                    "Gemini 답변이 미완성처럼 보임: %s",
-                    model
-                )
-
-                # 같은 모델에 한 번 더
-                # 완결형 답변을 요청
-                retry_question = (
+            # MAX_TOKENS로 끝난 경우, 억지로 잘라 보내지 않고
+            # 같은 모델에 짧게 다시 답하게 한다.
+            if finish_reason == "MAX_TOKENS":
+                continuation_question = (
                     question
                     + "\n\n"
-                    + "아까 답변이 중간에 끊긴 것 같아. "
-                    + "처음부터 다시, 완전한 문장으로 "
-                    + "짧고 자연스럽게 답해줘."
+                    + "방금 답변이 길이 제한에 걸린 것 같아. "
+                    + "처음부터 다시 답하되 핵심만 남기고 "
+                    + "완전한 문장으로 끝내줘."
                 )
 
                 try:
-
-                    retry_answer = call_gemini_model(
+                    second = call_gemini_model(
                         model,
-                        retry_question,
-                        use_search
+                        continuation_question,
+                        False
+                    )
+                    second_text = second.get("text", "")
+                    if second_text:
+                        answer = second_text
+                except Exception as continuation_exc:
+                    logger.warning(
+                        "Gemini 길이 재요청 실패: %s",
+                        continuation_exc
                     )
 
+            # 너무 긴 답변은 문장 중간에서 자르지 않는다.
+            answer = _trim_to_complete_sentence(
+                answer,
+                4900
+            )
+
+            if looks_incomplete(answer):
+                # 마지막에 조사/접속어만 남은 경우 한 번만 재생성
+                retry_question = (
+                    question
+                    + "\n\n"
+                    + "답변이 중간에 끊기지 않게 "
+                    + "핵심만 정리해서 완전한 문장으로 다시 답해줘."
+                )
+
+                try:
+                    retry_result = call_gemini_model(
+                        model,
+                        retry_question,
+                        False
+                    )
+                    retry_answer = retry_result.get("text", "")
                     if retry_answer:
-                        answer = retry_answer
-
+                        answer = _trim_to_complete_sentence(
+                            retry_answer,
+                            4900
+                        )
                 except Exception as retry_exc:
-
                     logger.warning(
-                        "Gemini 재답변 실패: %s",
+                        "Gemini 완결형 재답변 실패: %s",
                         retry_exc
                     )
 
             logger.info(
-                "Gemini 성공: model=%s search=%s",
+                "Gemini 성공: model=%s search=%s finish=%s",
                 model,
-                use_search
+                use_search,
+                finish_reason
             )
-
             return answer
 
         except Exception as exc:
+            error_text = str(exc)
+            errors.append(f"{model}: {error_text}")
 
-            errors.append(
-                f"{model}: {exc}"
-            )
+            if error_text.startswith("QUOTA_429:"):
+                # 무료/유료 한도 초과처럼 프로젝트 전체에 영향을 주는
+                # 429는 다른 모델을 연속 호출하지 않는다.
+                mark_gemini_quota_failure()
+                logger.warning(
+                    "Gemini quota 429: model=%s",
+                    model
+                )
+                break
 
             logger.warning(
                 "Gemini 실패: model=%s error=%s",
                 model,
-                exc
+                error_text
             )
-
-            mark_gemini_failure(
-                model
-            )
+            mark_gemini_failure(model)
 
     logger.error(
-        "모든 Gemini 모델 실패: %s",
+        "Gemini 최종 실패: %s",
         " | ".join(errors)[:3000]
     )
 
     return (
-        "으악... 잠깐만 🥄💫\n"
-        "내 장난감 두뇌가 전부 엉켜버렸어.\n"
-        "조금 있다가 다시 불러줘!"
+        "어... 잠깐만 🥄💫\n"
+        "내 장난감 두뇌가 지금 답을 제대로 가져오질 못했어.\n"
+        "조금 있다가 다시 `!질문`으로 불러줘!"
     )
 
 
