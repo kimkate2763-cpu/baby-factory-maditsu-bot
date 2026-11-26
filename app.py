@@ -7,7 +7,6 @@ import logging
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -26,10 +25,10 @@ app = Flask(__name__)
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 
-logger = logging.getLogger("baby-factory-maditsu-bot")
+logger = logging.getLogger("little-toy-store-pokey")
 
 KST = ZoneInfo("Asia/Seoul")
 
@@ -38,34 +37,21 @@ KST = ZoneInfo("Asia/Seoul")
 # 환경변수
 # =========================================================
 
-LINE_CHANNEL_SECRET = os.getenv(
-    "LINE_CHANNEL_SECRET",
-    "",
-).strip()
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "").strip()
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
 
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv(
-    "LINE_CHANNEL_ACCESS_TOKEN",
-    "",
-).strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "",
-).strip()
-
-GEMINI_API_KEY = os.getenv(
-    "GEMINI_API_KEY",
-    "",
-).strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
-    "gemini-3.8-flash",
+    "gemini-3.8-flash"
 ).strip()
 
 GEMINI_MODELS_ENV = os.getenv(
     "GEMINI_MODELS",
-    "",
+    ""
 ).strip()
 
 
@@ -81,31 +67,16 @@ DEFAULT_GEMINI_MODELS = [
 
 GEMINI_FAILURE_COOLDOWN = 60
 
-GEMINI_CONNECT_TIMEOUT = 1.2
+# 너무 짧으면 네트워크가 조금만 느려도 실패할 수 있어서 여유 있게 설정
+GEMINI_CONNECT_TIMEOUT = 2.5
+GEMINI_READ_TIMEOUT = 15.0
 
-GEMINI_READ_TIMEOUT = 7.0
+# Gemini가 답변을 너무 짧게 끊지 않도록 충분히 확보
+GEMINI_MAX_OUTPUT_TOKENS = 900
+
 
 _gemini_lock = threading.RLock()
-
-_gemini_preferred_model = None
-
 _gemini_failed_until = {}
-
-
-def get_configured_gemini_models():
-    models = []
-
-    for model in (
-        [GEMINI_MODEL]
-        + GEMINI_MODELS_ENV.split(",")
-        + DEFAULT_GEMINI_MODELS
-    ):
-        model = model.strip()
-
-        if model and model not in models:
-            models.append(model)
-
-    return models
 
 
 # =========================================================
@@ -117,11 +88,15 @@ http = requests.Session()
 http.mount(
     "https://",
     HTTPAdapter(
-        pool_connections=8,
-        pool_maxsize=16,
-        max_retries=0,
-    ),
+        pool_connections=10,
+        pool_maxsize=20,
+        max_retries=0
+    )
 )
+
+http.headers.update({
+    "User-Agent": "Little-Toy-Store-Pokey-Bot/1.0"
+})
 
 
 # =========================================================
@@ -129,75 +104,76 @@ http.mount(
 # =========================================================
 
 _db_lock = threading.RLock()
-
 _db_init_lock = threading.Lock()
 
 _db_connection = None
-
 _db_connection_created_at = 0.0
-
 _db_initialized = False
 
 DB_CONNECT_TIMEOUT = 5
-
-DB_RECONNECT_AFTER = 1800
-
+DB_RECONNECT_AFTER = 1200
 DB_STATEMENT_TIMEOUT = 8000
 
 
 # =========================================================
-# 프로필 캐시
+# LINE 프로필 캐시
 # =========================================================
 
 _PROFILE_CACHE = {}
-
 _PROFILE_CACHE_LOCK = threading.Lock()
 
 _PROFILE_CACHE_TTL = 600
 
 _PROFILE_LOOKUPS_IN_FLIGHT = set()
 
-_PROFILE_EXECUTOR = ThreadPoolExecutor(
-    max_workers=1,
-    thread_name_prefix="line-profile",
-)
+
+# =========================================================
+# Gemini 모델 목록
+# =========================================================
+
+def get_configured_gemini_models():
+    models = []
+
+    raw_models = [
+        GEMINI_MODEL,
+        *GEMINI_MODELS_ENV.split(","),
+        *DEFAULT_GEMINI_MODELS,
+    ]
+
+    for model in raw_models:
+        model = model.strip()
+
+        if model and model not in models:
+            models.append(model)
+
+    return models
 
 
 # =========================================================
-# DB 연결 종료
+# DB 연결
 # =========================================================
 
 def _close_db_locked():
-
     global _db_connection
     global _db_connection_created_at
 
     conn = _db_connection
 
     _db_connection = None
-
     _db_connection_created_at = 0.0
 
     if conn is not None:
-
         try:
             conn.close()
-
         except Exception:
             pass
 
 
-# =========================================================
-# DB 연결 생성
-# =========================================================
-
 def _connect_db_locked():
-
     global _db_connection
     global _db_connection_created_at
 
     if not DATABASE_URL:
-
         raise RuntimeError(
             "DATABASE_URL 환경변수가 설정되지 않았습니다."
         )
@@ -208,7 +184,7 @@ def _connect_db_locked():
         DATABASE_URL,
         row_factory=dict_row,
         connect_timeout=DB_CONNECT_TIMEOUT,
-        autocommit=False,
+        autocommit=False
     )
 
     conn.execute(
@@ -218,62 +194,45 @@ def _connect_db_locked():
     conn.commit()
 
     _db_connection = conn
-
     _db_connection_created_at = time.monotonic()
+
+    logger.info("Neon DB 연결 완료")
 
     return conn
 
 
-# =========================================================
-# DB 연결 가져오기
-# =========================================================
-
 def _get_connection_locked():
-
     if _db_connection is None:
-
         return _connect_db_locked()
 
     try:
-
         if _db_connection.closed:
-
             return _connect_db_locked()
-
     except Exception:
-
         return _connect_db_locked()
 
     if (
-        time.monotonic()
-        - _db_connection_created_at
+        time.monotonic() - _db_connection_created_at
         >= DB_RECONNECT_AFTER
     ):
-
         return _connect_db_locked()
 
     return _db_connection
 
 
-# =========================================================
-# DB 연결 오류 판별
-# =========================================================
-
 def _is_connection_error(exc):
-
     if isinstance(
         exc,
         (
             psycopg.OperationalError,
             psycopg.InterfaceError,
-        ),
+        )
     ):
-
         return True
 
     text = str(exc).lower()
 
-    keywords = (
+    error_words = (
         "server closed",
         "connection is closed",
         "connection not open",
@@ -284,20 +243,14 @@ def _is_connection_error(exc):
         "terminating connection",
         "connection timed out",
         "could not connect",
+        "timeout expired",
+        "network",
     )
 
-    return any(
-        keyword in text
-        for keyword in keywords
-    )
+    return any(word in text for word in error_words)
 
-
-# =========================================================
-# DB 초기화
-# =========================================================
 
 def init_database():
-
     global _db_initialized
 
     if _db_initialized:
@@ -314,120 +267,81 @@ def init_database():
 
             try:
 
-                conn.execute(
-                    """
+                conn.execute("""
                     CREATE TABLE IF NOT EXISTS message_events (
                         event_id TEXT PRIMARY KEY,
                         group_id TEXT NOT NULL,
                         user_id TEXT NOT NULL,
-                        display_name TEXT NOT NULL
-                            DEFAULT '이름 미확인',
+                        display_name TEXT NOT NULL DEFAULT '이름 미확인',
                         message_date DATE NOT NULL,
-                        character_count INTEGER NOT NULL
-                            DEFAULT 0,
-                        created_at TIMESTAMPTZ NOT NULL
-                            DEFAULT NOW()
+                        character_count INTEGER NOT NULL DEFAULT 0,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     )
-                    """
-                )
+                """)
 
-                conn.execute(
-                    """
+                conn.execute("""
                     CREATE INDEX IF NOT EXISTS
                     idx_message_group_date
-                    ON message_events
-                    (group_id, message_date)
-                    """
-                )
+                    ON message_events(group_id, message_date)
+                """)
 
-                conn.execute(
-                    """
+                conn.execute("""
                     CREATE INDEX IF NOT EXISTS
                     idx_message_group_user_date
-                    ON message_events
-                    (group_id, user_id, message_date)
-                    """
-                )
+                    ON message_events(group_id, user_id, message_date)
+                """)
 
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS
-                    group_authenticators (
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS group_authenticators (
                         group_id TEXT NOT NULL,
                         user_id TEXT NOT NULL,
-                        display_name TEXT NOT NULL
-                            DEFAULT '이름 미확인',
-                        registered_at TIMESTAMPTZ
-                            NOT NULL DEFAULT NOW(),
-                        PRIMARY KEY (
-                            group_id,
-                            user_id
-                        )
+                        display_name TEXT NOT NULL DEFAULT '이름 미확인',
+                        registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        PRIMARY KEY(group_id, user_id)
                     )
-                    """
-                )
+                """)
 
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS
-                    group_admins (
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS group_admins (
                         group_id TEXT NOT NULL,
                         user_id TEXT NOT NULL,
-                        display_name TEXT NOT NULL
-                            DEFAULT '이름 미확인',
-                        registered_at TIMESTAMPTZ
-                            NOT NULL DEFAULT NOW(),
-                        PRIMARY KEY (
-                            group_id,
-                            user_id
-                        )
+                        display_name TEXT NOT NULL DEFAULT '이름 미확인',
+                        registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        PRIMARY KEY(group_id, user_id)
                     )
-                    """
-                )
+                """)
 
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS
-                    bot_runtime_state (
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS bot_runtime_state (
                         state_key TEXT PRIMARY KEY,
                         state_value TEXT,
-                        updated_at TIMESTAMPTZ
-                            NOT NULL DEFAULT NOW()
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     )
-                    """
-                )
+                """)
 
                 conn.commit()
 
                 _db_initialized = True
 
-                logger.info(
-                    "데이터베이스 초기화 완료"
-                )
+                logger.info("데이터베이스 초기화 완료")
 
             except Exception:
 
                 try:
                     conn.rollback()
-
                 except Exception:
                     pass
 
                 raise
 
 
-# =========================================================
-# DB 실행
-# =========================================================
-
 def db_execute(
     sql,
     params=None,
     *,
     fetchone=False,
-    fetchall=False,
+    fetchall=False
 ):
-
     global _db_connection
 
     if not _db_initialized:
@@ -445,21 +359,15 @@ def db_execute(
 
                 try:
 
-                    cur = conn.execute(
-                        sql,
-                        params,
-                    )
+                    cur = conn.execute(sql, params)
 
                     if fetchone:
-
                         result = cur.fetchone()
 
                     elif fetchall:
-
                         result = cur.fetchall()
 
                     else:
-
                         result = cur.rowcount
 
                     conn.commit()
@@ -470,18 +378,21 @@ def db_execute(
 
                     try:
                         conn.rollback()
-
                     except Exception:
                         pass
 
                     if _is_connection_error(exc):
+
+                        logger.warning(
+                            "DB 연결 오류 → 재연결 시도: %s",
+                            exc
+                        )
 
                         _close_db_locked()
 
                         last_error = exc
 
                     else:
-
                         raise
 
         except Exception as exc:
@@ -492,148 +403,114 @@ def db_execute(
                 attempt == 0
                 and _is_connection_error(exc)
             ):
-
-                time.sleep(0.2)
-
+                time.sleep(0.25)
                 continue
 
             raise
 
         if last_error is not None:
+            time.sleep(0.25)
 
-            time.sleep(0.2)
-
-    raise (
-        last_error
-        or RuntimeError("DB 작업 실패")
-    )
+    raise last_error or RuntimeError("DB 작업 실패")
 
 
-def db_fetchone(
-    sql,
-    params=None,
-):
-
+def db_fetchone(sql, params=None):
     return db_execute(
         sql,
         params,
-        fetchone=True,
+        fetchone=True
     )
 
 
-def db_fetchall(
-    sql,
-    params=None,
-):
-
+def db_fetchall(sql, params=None):
     return (
         db_execute(
             sql,
             params,
-            fetchall=True,
+            fetchall=True
         )
         or []
     )
 
 
 # =========================================================
-# LINE 공통 헤더
+# LINE
 # =========================================================
 
 def line_headers():
-
     return {
-        "Authorization":
-            f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
-        "Content-Type":
-            "application/json",
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
     }
 
 
-# =========================================================
-# 프로필 URL
-# =========================================================
+def _profile_url(source, group_id, user_id):
 
-def _profile_url(
-    source,
-    group_id,
-    user_id,
-):
-
-    source_type = source.get(
-        "type"
-    )
-
-    if (
-        source_type == "group"
-        and group_id
-    ):
-
+    if source.get("type") == "group" and group_id:
         return (
-            "https://api.line.me/v2/bot/group/"
+            f"https://api.line.me/v2/bot/group/"
             f"{group_id}/member/{user_id}"
         )
 
-    if (
-        source_type == "room"
-        and group_id
-    ):
-
+    if source.get("type") == "room" and group_id:
         return (
-            "https://api.line.me/v2/bot/room/"
+            f"https://api.line.me/v2/bot/room/"
             f"{group_id}/member/{user_id}"
         )
 
     return (
-        "https://api.line.me/v2/bot/profile/"
-        f"{user_id}"
+        f"https://api.line.me/v2/bot/profile/{user_id}"
     )
 
 
 # =========================================================
-# 실제 이름 DB 저장
+# 프로필
 # =========================================================
 
 def _save_profile_name(
     group_id,
     user_id,
-    name,
+    name
 ):
 
     for table in (
         "message_events",
         "group_authenticators",
-        "group_admins",
+        "group_admins"
     ):
 
-        db_execute(
-            f"""
-            UPDATE {table}
-            SET display_name = %s
-            WHERE group_id = %s
-              AND user_id = %s
-              AND (
-                  display_name LIKE '사용자-%%'
-                  OR display_name = '이름 미확인'
-              )
-            """,
-            (
-                name,
-                group_id,
-                user_id,
-            ),
-        )
+        try:
 
+            db_execute(
+                f"""
+                UPDATE {table}
+                SET display_name=%s
+                WHERE group_id=%s
+                  AND user_id=%s
+                  AND (
+                      display_name LIKE '사용자-%%'
+                      OR display_name='이름 미확인'
+                  )
+                """,
+                (
+                    name,
+                    group_id,
+                    user_id
+                )
+            )
 
-# =========================================================
-# LINE 프로필 조회
-# =========================================================
+        except Exception:
+            logger.warning(
+                "프로필 이름 DB 갱신 실패",
+                exc_info=True
+            )
+
 
 def _fetch_profile_name(
     source,
     group_id,
     user_id,
-    cache_key,
+    cache_key
 ):
 
     try:
@@ -645,18 +522,16 @@ def _fetch_profile_name(
             _profile_url(
                 source,
                 group_id,
-                user_id,
+                user_id
             ),
             headers=line_headers(),
-            timeout=(1.5, 2.5),
+            timeout=(1.5, 3.0)
         )
 
         if response.status_code != 200:
             return None
 
-        data = response.json()
-
-        name = data.get(
+        name = response.json().get(
             "displayName"
         )
 
@@ -664,28 +539,19 @@ def _fetch_profile_name(
             return None
 
         with _PROFILE_CACHE_LOCK:
-
-            _PROFILE_CACHE[
-                cache_key
-            ] = (
+            _PROFILE_CACHE[cache_key] = (
                 time.time(),
-                name,
+                name
             )
 
         try:
-
             _save_profile_name(
                 group_id,
                 user_id,
-                name,
+                name
             )
-
         except Exception:
-
-            logger.warning(
-                "프로필 이름 DB 갱신 실패",
-                exc_info=True,
-            )
+            pass
 
         return name
 
@@ -693,7 +559,7 @@ def _fetch_profile_name(
 
         logger.warning(
             "프로필 조회 실패",
-            exc_info=True,
+            exc_info=True
         )
 
         return None
@@ -701,19 +567,14 @@ def _fetch_profile_name(
     finally:
 
         with _PROFILE_CACHE_LOCK:
-
             _PROFILE_LOOKUPS_IN_FLIGHT.discard(
                 cache_key
             )
 
 
-# =========================================================
-# 최근 이름 조회
-# =========================================================
-
 def get_recent_display_name(
     group_id,
-    user_id,
+    user_id
 ):
 
     try:
@@ -722,55 +583,48 @@ def get_recent_display_name(
             """
             SELECT display_name
             FROM message_events
-            WHERE group_id = %s
-              AND user_id = %s
+            WHERE group_id=%s
+              AND user_id=%s
               AND display_name IS NOT NULL
-              AND display_name <> ''
+              AND display_name<>''
               AND display_name NOT LIKE '사용자-%%'
-              AND display_name <> '이름 미확인'
+              AND display_name<>'이름 미확인'
             ORDER BY created_at DESC
             LIMIT 1
             """,
             (
                 group_id,
-                user_id,
-            ),
+                user_id
+            )
         )
 
         if row:
-
             return row.get(
                 "display_name"
             )
 
     except Exception:
-
         pass
 
     return None
 
-
-# =========================================================
-# 표시 이름
-# =========================================================
 
 def get_display_name(
     source,
     group_id,
     user_id,
     *,
-    force_fetch=False,
+    force_fetch=False
 ):
 
     fallback = (
-        "사용자-"
-        + user_id[-6:]
+        "사용자-" + user_id[-6:]
     )
 
     cache_key = (
         source.get("type"),
         group_id,
-        user_id,
+        user_id
     )
 
     with _PROFILE_CACHE_LOCK:
@@ -782,60 +636,45 @@ def get_display_name(
         if (
             cached
             and time.time() - cached[0]
-            < _PROFILE_CACHE_TTL
+            < 600
             and not force_fetch
         ):
-
             return cached[1]
 
-    recent_name = get_recent_display_name(
+    recent = get_recent_display_name(
         group_id,
-        user_id,
+        user_id
     )
 
-    if (
-        recent_name
-        and not force_fetch
-    ):
+    if recent and not force_fetch:
 
         with _PROFILE_CACHE_LOCK:
-
-            _PROFILE_CACHE[
-                cache_key
-            ] = (
+            _PROFILE_CACHE[cache_key] = (
                 time.time(),
-                recent_name,
+                recent
             )
 
-        return recent_name
+        return recent
 
     if force_fetch:
 
-        fetched_name = _fetch_profile_name(
+        fetched = _fetch_profile_name(
             source,
             group_id,
             user_id,
-            cache_key,
+            cache_key
         )
 
-        if fetched_name:
+        if fetched:
+            return fetched
 
-            return fetched_name
+    return recent or fallback
 
-    return (
-        recent_name
-        or fallback
-    )
-
-
-# =========================================================
-# 프로필 비동기 조회
-# =========================================================
 
 def schedule_profile_lookup(
     source,
     group_id,
-    user_id,
+    user_id
 ):
 
     if not LINE_CHANNEL_ACCESS_TOKEN:
@@ -844,7 +683,7 @@ def schedule_profile_lookup(
     cache_key = (
         source.get("type"),
         group_id,
-        user_id,
+        user_id
     )
 
     with _PROFILE_CACHE_LOCK:
@@ -856,56 +695,55 @@ def schedule_profile_lookup(
         if (
             cached
             and time.time() - cached[0]
-            < _PROFILE_CACHE_TTL
+            < 600
         ):
-
             return
 
-        if (
-            cache_key
-            in _PROFILE_LOOKUPS_IN_FLIGHT
-        ):
-
+        if cache_key in _PROFILE_LOOKUPS_IN_FLIGHT:
             return
 
         _PROFILE_LOOKUPS_IN_FLIGHT.add(
             cache_key
         )
 
-    try:
-
-        _PROFILE_EXECUTOR.submit(
-            _fetch_profile_name,
+    # 프로필은 명령 처리와 분리해서
+    # 현재 메시지 응답을 막지 않는다.
+    thread = threading.Thread(
+        target=_fetch_profile_name,
+        args=(
             source,
             group_id,
             user_id,
-            cache_key,
-        )
+            cache_key
+        ),
+        daemon=True
+    )
 
-    except Exception:
-
-        with _PROFILE_CACHE_LOCK:
-
-            _PROFILE_LOOKUPS_IN_FLIGHT.discard(
-                cache_key
-            )
+    thread.start()
 
 
 # =========================================================
-# 일반 LINE 답장
+# LINE 응답
 # =========================================================
 
 def reply_text(
     reply_token,
-    text,
+    text
 ):
 
     if (
         not reply_token
         or not LINE_CHANNEL_ACCESS_TOKEN
     ):
-
         return False
+
+    text = str(text).strip()
+
+    if not text:
+        return False
+
+    # LINE 일반 텍스트 안전 길이
+    text = text[:4900]
 
     try:
 
@@ -913,26 +751,23 @@ def reply_text(
             "https://api.line.me/v2/bot/message/reply",
             headers=line_headers(),
             json={
-                "replyToken":
-                    reply_token,
+                "replyToken": reply_token,
                 "messages": [
                     {
                         "type": "text",
-                        "text":
-                            str(text)[:4900],
+                        "text": text
                     }
-                ],
+                ]
             },
-            timeout=(2.5, 6),
+            timeout=(2.5, 7.0)
         )
 
         if not response.ok:
 
             logger.error(
-                "LINE 답장 실패: "
-                "status=%s body=%s",
+                "LINE 답장 실패: %s %s",
                 response.status_code,
-                response.text[:500],
+                response.text[:500]
             )
 
             return False
@@ -949,20 +784,19 @@ def reply_text(
 
 
 # =========================================================
-# 그룹 멤버 확인
+# 멘션
 # =========================================================
 
 def _member_exists_in_group(
     source,
     group_id,
-    user_id,
+    user_id
 ):
 
     if (
         not LINE_CHANNEL_ACCESS_TOKEN
         or not user_id
     ):
-
         return None
 
     try:
@@ -971,10 +805,10 @@ def _member_exists_in_group(
             _profile_url(
                 source,
                 group_id,
-                user_id,
+                user_id
             ),
             headers=line_headers(),
-            timeout=(1.5, 2.5),
+            timeout=(1.5, 2.5)
         )
 
         if response.status_code == 200:
@@ -986,24 +820,18 @@ def _member_exists_in_group(
         return None
 
     except Exception:
-
         return None
 
-
-# =========================================================
-# 유효 멘션 멤버
-# =========================================================
 
 def get_valid_mention_members(
     source,
     group_id,
     members,
     *,
-    table_name,
+    table_name
 ):
 
     valid = []
-
     stale = []
 
     for member in members:
@@ -1018,20 +846,14 @@ def get_valid_mention_members(
         status = _member_exists_in_group(
             source,
             group_id,
-            user_id,
+            user_id
         )
 
         if status is True:
-
-            valid.append(
-                member
-            )
+            valid.append(member)
 
         elif status is False:
-
-            stale.append(
-                user_id
-            )
+            stale.append(user_id)
 
     for user_id in stale:
 
@@ -1042,44 +864,36 @@ def get_valid_mention_members(
         )
 
         try:
-
             db_execute(
                 f"""
                 DELETE FROM {table}
-                WHERE group_id = %s
-                  AND user_id = %s
+                WHERE group_id=%s
+                  AND user_id=%s
                 """,
                 (
                     group_id,
-                    user_id,
-                ),
+                    user_id
+                )
             )
-
         except Exception:
-
             pass
 
     return valid
 
 
-# =========================================================
-# LINE 멘션
-# =========================================================
-
 def reply_mention(
     reply_token,
     text,
-    members,
+    members
 ):
 
     if (
         not reply_token
         or not LINE_CHANNEL_ACCESS_TOKEN
     ):
-
         return False
 
-    valid_members = [
+    valid = [
         member
         for member in members
         if str(
@@ -1087,20 +901,18 @@ def reply_mention(
         ).startswith("U")
     ][:20]
 
-    if not valid_members:
-
+    if not valid:
         return reply_text(
             reply_token,
-            text,
+            text
         )
 
     substitution = {}
-
     placeholders = []
 
     for index, member in enumerate(
-        valid_members,
-        start=1,
+        valid,
+        1
     ):
 
         key = f"member{index}"
@@ -1110,21 +922,22 @@ def reply_mention(
         )
 
         substitution[key] = {
-            "type":
-                "mention",
+            "type": "mention",
             "mentionee": {
-                "type":
-                    "user",
-                "userId":
-                    member["user_id"],
-            },
+                "type": "user",
+                "userId": member[
+                    "user_id"
+                ]
+            }
         }
 
-    message_text = (
+    body = (
         str(text).rstrip()
         + "\n"
         + " ".join(placeholders)
     )
+
+    body = body[:4900]
 
     try:
 
@@ -1132,29 +945,24 @@ def reply_mention(
             "https://api.line.me/v2/bot/message/reply",
             headers=line_headers(),
             json={
-                "replyToken":
-                    reply_token,
+                "replyToken": reply_token,
                 "messages": [
                     {
-                        "type":
-                            "textV2",
-                        "text":
-                            message_text[:4900],
-                        "substitution":
-                            substitution,
+                        "type": "textV2",
+                        "text": body,
+                        "substitution": substitution
                     }
-                ],
+                ]
             },
-            timeout=(2.5, 6),
+            timeout=(2.5, 7.0)
         )
 
         if not response.ok:
 
             logger.error(
-                "LINE 멘션 실패: "
-                "status=%s body=%s",
+                "LINE 멘션 실패: %s %s",
                 response.status_code,
-                response.text[:700],
+                response.text[:500]
             )
 
             return False
@@ -1171,7 +979,7 @@ def reply_mention(
 
 
 # =========================================================
-# 메시지 기록
+# 마딧수 기록
 # =========================================================
 
 def record_message(
@@ -1180,23 +988,21 @@ def record_message(
     user_id,
     display_name,
     message_date,
-    character_count,
+    character_count
 ):
 
     db_execute(
         """
-        INSERT INTO message_events
-            (
-                event_id,
-                group_id,
-                user_id,
-                display_name,
-                message_date,
-                character_count
-            )
-        VALUES
-            (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (event_id)
+        INSERT INTO message_events(
+            event_id,
+            group_id,
+            user_id,
+            display_name,
+            message_date,
+            character_count
+        )
+        VALUES(%s,%s,%s,%s,%s,%s)
+        ON CONFLICT(event_id)
         DO NOTHING
         """,
         (
@@ -1205,8 +1011,8 @@ def record_message(
             user_id,
             display_name,
             message_date,
-            character_count,
-        ),
+            character_count
+        )
     )
 
 
@@ -1217,69 +1023,58 @@ def record_message(
 def register_authenticator(
     group_id,
     user_id,
-    display_name,
+    display_name
 ):
 
     db_execute(
         """
-        INSERT INTO group_authenticators
-            (
-                group_id,
-                user_id,
-                display_name
-            )
-        VALUES
-            (%s, %s, %s)
-        ON CONFLICT
-            (group_id, user_id)
+        INSERT INTO group_authenticators(
+            group_id,
+            user_id,
+            display_name
+        )
+        VALUES(%s,%s,%s)
+        ON CONFLICT(group_id,user_id)
         DO UPDATE SET
-            display_name =
-                EXCLUDED.display_name,
-            registered_at =
-                NOW()
+            display_name=EXCLUDED.display_name,
+            registered_at=NOW()
         """,
         (
             group_id,
             user_id,
-            display_name,
-        ),
+            display_name
+        )
     )
 
 
 def unregister_authenticator(
     group_id,
-    user_id,
+    user_id
 ):
 
     return db_execute(
         """
         DELETE FROM group_authenticators
-        WHERE group_id = %s
-          AND user_id = %s
+        WHERE group_id=%s
+          AND user_id=%s
         """,
         (
             group_id,
-            user_id,
-        ),
+            user_id
+        )
     )
 
 
-def get_authenticators(
-    group_id,
-):
+def get_authenticators(group_id):
 
     return db_fetchall(
         """
-        SELECT
-            user_id,
-            display_name
+        SELECT user_id, display_name
         FROM group_authenticators
-        WHERE group_id = %s
+        WHERE group_id=%s
         ORDER BY registered_at ASC
         """,
-        (
-            group_id,
-        ),
+        (group_id,)
     )
 
 
@@ -1290,102 +1085,63 @@ def get_authenticators(
 def register_admin(
     group_id,
     user_id,
-    display_name,
+    display_name
 ):
 
     db_execute(
         """
-        INSERT INTO group_admins
-            (
-                group_id,
-                user_id,
-                display_name
-            )
-        VALUES
-            (%s, %s, %s)
-        ON CONFLICT
-            (group_id, user_id)
+        INSERT INTO group_admins(
+            group_id,
+            user_id,
+            display_name
+        )
+        VALUES(%s,%s,%s)
+        ON CONFLICT(group_id,user_id)
         DO UPDATE SET
-            display_name =
-                EXCLUDED.display_name,
-            registered_at =
-                NOW()
+            display_name=EXCLUDED.display_name,
+            registered_at=NOW()
         """,
         (
             group_id,
             user_id,
-            display_name,
-        ),
+            display_name
+        )
     )
 
 
 def unregister_admin(
     group_id,
-    user_id,
+    user_id
 ):
 
     return db_execute(
         """
         DELETE FROM group_admins
-        WHERE group_id = %s
-          AND user_id = %s
+        WHERE group_id=%s
+          AND user_id=%s
         """,
         (
             group_id,
-            user_id,
-        ),
+            user_id
+        )
     )
 
 
-def get_admins(
-    group_id,
-):
+def get_admins(group_id):
 
     return db_fetchall(
         """
-        SELECT
-            user_id,
-            display_name
+        SELECT user_id, display_name
         FROM group_admins
-        WHERE group_id = %s
+        WHERE group_id=%s
         ORDER BY registered_at ASC
         """,
-        (
-            group_id,
-        ),
+        (group_id,)
     )
 
 
 # =========================================================
-# 주간 날짜
-# =========================================================
-
-def get_week_start(
-    target_date,
-):
-
-    return (
-        target_date
-        - timedelta(
-            days=target_date.weekday()
-        )
-    )
-
-
-def get_week_end(
-    target_date,
-):
-
-    return (
-        get_week_start(
-            target_date
-        )
-        + timedelta(days=6)
-    )
-
-
-# =========================================================
-# 주간 칭호
+# 마딧수 칭호
 # =========================================================
 
 WEEKLY_TITLE_TABLE = [
@@ -1414,109 +1170,200 @@ WEEKLY_TITLE_TABLE = [
 ]
 
 
-def get_weekly_title(
-    message_count,
-):
+def get_week_start(date_value):
+    return (
+        date_value
+        - timedelta(
+            days=date_value.weekday()
+        )
+    )
 
-    if message_count < 100:
+
+def get_week_end(date_value):
+    return (
+        get_week_start(date_value)
+        + timedelta(days=6)
+    )
+
+
+def get_weekly_title(count):
+
+    if count < 100:
         return "칭호 없음"
 
-    current_title = "칭호 없음"
+    title = "칭호 없음"
 
-    for threshold, title in WEEKLY_TITLE_TABLE:
+    for threshold, name in WEEKLY_TITLE_TABLE:
 
-        if message_count >= threshold:
-
-            current_title = title
-
+        if count >= threshold:
+            title = name
         else:
-
             break
 
-    if message_count >= 20000:
+    if count >= 20000:
 
-        extra_level = (
-            message_count - 20000
+        extra = (
+            count - 20000
         ) // 1000
 
-        if extra_level > 0:
-
-            current_title = (
-                "👑 채팅창의 유일신 "
-                f"— 초월 {extra_level + 1}단계"
+        if extra > 0:
+            title = (
+                "👑 채팅창의 유일신 — "
+                f"초월 {extra + 1}단계"
             )
 
-    return current_title
+    return title
 
 
 # =========================================================
-# 주간 개인 통계
+# 마딧수 통계
 # =========================================================
+
+def get_my_stats(
+    group_id,
+    user_id,
+    today,
+    display_name
+):
+
+    row = db_fetchone(
+        """
+        WITH c AS (
+            SELECT
+                user_id,
+                COUNT(*) AS message_count,
+                COALESCE(
+                    SUM(character_count),
+                    0
+                ) AS character_count
+            FROM message_events
+            WHERE group_id=%s
+              AND message_date=%s
+            GROUP BY user_id
+        ),
+        r AS (
+            SELECT
+                *,
+                RANK() OVER(
+                    ORDER BY message_count DESC
+                ) AS user_rank
+            FROM c
+        )
+        SELECT
+            message_count,
+            character_count,
+            user_rank
+        FROM r
+        WHERE user_id=%s
+        """,
+        (
+            group_id,
+            today,
+            user_id
+        )
+    )
+
+    count = (
+        row["message_count"]
+        if row else 0
+    )
+
+    chars = (
+        row["character_count"]
+        if row else 0
+    )
+
+    rank = (
+        row["user_rank"]
+        if row else "-"
+    )
+
+    weekly_count, weekly_rank, weekly_title, week_start, week_end = (
+        get_weekly_stats(
+            group_id,
+            user_id,
+            today
+        )
+    )
+
+    if weekly_title == "칭호 없음":
+
+        title_text = (
+            "아직 칭호가 없습니다.\n"
+            "이번 주 100마딧수를 달성해보세요!"
+        )
+
+    else:
+
+        title_text = (
+            f"이번 주 칭호: {weekly_title}"
+        )
+
+    return (
+        f"📊 {display_name}님의 마딧수\n"
+        f"오늘 마딧수: {count}개\n"
+        f"공백 제외 글자 수: {chars}자\n"
+        f"오늘 순위: {rank}위\n\n"
+        f"📅 이번 주\n"
+        f"마딧수: {weekly_count}개\n"
+        f"주간 순위: {weekly_rank}위\n"
+        f"{title_text}"
+    )
+
 
 def get_weekly_stats(
     group_id,
     user_id,
-    today,
+    today
 ):
 
-    week_start = get_week_start(
-        today
-    )
-
-    week_end = get_week_end(
-        today
-    )
+    start = get_week_start(today)
+    end = get_week_end(today)
 
     row = db_fetchone(
         """
-        WITH weekly_counts AS (
+        WITH c AS (
             SELECT
                 user_id,
                 COUNT(*) AS message_count
             FROM message_events
-            WHERE group_id = %s
-              AND message_date >= %s
-              AND message_date <= %s
+            WHERE group_id=%s
+              AND message_date
+                  BETWEEN %s AND %s
             GROUP BY user_id
         ),
-        ranked AS (
+        r AS (
             SELECT
                 user_id,
                 message_count,
-                RANK() OVER (
+                RANK() OVER(
                     ORDER BY message_count DESC
                 ) AS weekly_rank
-            FROM weekly_counts
+            FROM c
         )
         SELECT
             message_count,
             weekly_rank
-        FROM ranked
-        WHERE user_id = %s
+        FROM r
+        WHERE user_id=%s
         """,
         (
             group_id,
-            week_start,
-            week_end,
-            user_id,
-        ),
+            start,
+            end,
+            user_id
+        )
     )
 
-    if row:
+    count = (
+        row["message_count"]
+        if row else 0
+    )
 
-        count = row[
-            "message_count"
-        ]
-
-        rank = row[
-            "weekly_rank"
-        ]
-
-    else:
-
-        count = 0
-
-        rank = "-"
+    rank = (
+        row["weekly_rank"]
+        if row else "-"
+    )
 
     title = get_weekly_title(
         count
@@ -1526,364 +1373,187 @@ def get_weekly_stats(
         count,
         rank,
         title,
-        week_start,
-        week_end,
+        start,
+        end
     )
 
-
-# =========================================================
-# 내 마딧수
-# =========================================================
-
-def get_my_stats(
-    group_id,
-    user_id,
-    today,
-    display_name,
-):
-
-    row = db_fetchone(
-        """
-        WITH daily_counts AS (
-            SELECT
-                user_id,
-                COUNT(*) AS message_count,
-                COALESCE(
-                    SUM(character_count),
-                    0
-                ) AS character_count
-            FROM message_events
-            WHERE group_id = %s
-              AND message_date = %s
-            GROUP BY user_id
-        ),
-        ranked AS (
-            SELECT
-                user_id,
-                message_count,
-                character_count,
-                RANK() OVER (
-                    ORDER BY message_count DESC
-                ) AS user_rank
-            FROM daily_counts
-        )
-        SELECT
-            message_count,
-            character_count,
-            user_rank
-        FROM ranked
-        WHERE user_id = %s
-        """,
-        (
-            group_id,
-            today,
-            user_id,
-        ),
-    )
-
-    if row:
-
-        count = row[
-            "message_count"
-        ]
-
-        chars = row[
-            "character_count"
-        ]
-
-        rank = row[
-            "user_rank"
-        ]
-
-    else:
-
-        count = 0
-        chars = 0
-        rank = "-"
-
-    (
-        weekly_count,
-        weekly_rank,
-        weekly_title,
-        week_start,
-        week_end,
-    ) = get_weekly_stats(
-        group_id,
-        user_id,
-        today,
-    )
-
-    if weekly_title == "칭호 없음":
-
-        title_text = (
-            "아직 칭호가 없습니다.\n"
-            "이번 주 100마디를 달성하면 "
-            "첫 칭호를 얻어요!"
-        )
-
-    else:
-
-        title_text = (
-            f"「{weekly_title}」"
-        )
-
-    return (
-        "📊 오늘의 마딧수\n"
-        f"이름: {display_name}\n"
-        f"날짜: {today}\n"
-        f"내 마딧수: {count:,}마디\n"
-        f"공백 제외 글자 수: {chars:,}자\n"
-        f"오늘의 순위: {rank}위\n"
-        "\n"
-        "👑 이번 주 마딧수\n"
-        f"기간: {week_start} ~ {week_end}\n"
-        f"이번 주 마딧수: {weekly_count:,}마디\n"
-        f"이번 주 순위: {weekly_rank}위\n"
-        f"이번 주 칭호: {title_text}"
-    )
-
-
-# =========================================================
-# 마딧수 순위
-# =========================================================
 
 def get_ranking(
     group_id,
     start_date,
     end_date,
-    title,
+    label
 ):
 
     rows = db_fetchall(
         """
         SELECT
             user_id,
+            MAX(display_name) AS display_name,
+            COUNT(*) AS message_count,
             COALESCE(
-                MAX(display_name)
-                FILTER (
-                    WHERE display_name
-                    NOT LIKE '사용자-%%'
-                    AND display_name <>
-                        '이름 미확인'
-                ),
-                MAX(display_name)
-            ) AS display_name,
-            COUNT(*) AS message_count
+                SUM(character_count),
+                0
+            ) AS character_count
         FROM message_events
-        WHERE group_id = %s
-          AND message_date >= %s
-          AND message_date <= %s
+        WHERE group_id=%s
+          AND message_date
+              BETWEEN %s AND %s
         GROUP BY user_id
-        ORDER BY
-            message_count DESC,
-            LOWER(
-                COALESCE(
-                    MAX(display_name)
-                    FILTER (
-                        WHERE display_name
-                        NOT LIKE '사용자-%%'
-                        AND display_name <>
-                            '이름 미확인'
-                    ),
-                    MAX(display_name)
-                )
-            ) ASC
-        LIMIT 100
+        ORDER BY message_count DESC,
+                 character_count DESC
+        LIMIT 50
         """,
         (
             group_id,
             start_date,
-            end_date,
-        ),
+            end_date
+        )
     )
-
-    summary = db_fetchone(
-        """
-        SELECT
-            COUNT(*) AS total_messages,
-            COUNT(DISTINCT user_id)
-                AS participant_count
-        FROM message_events
-        WHERE group_id = %s
-          AND message_date >= %s
-          AND message_date <= %s
-        """,
-        (
-            group_id,
-            start_date,
-            end_date,
-        ),
-    )
-
-    lines = [
-        f"📊 마딧수 순위: {title}",
-        (
-            f"전체 메시지: "
-            f"{summary['total_messages']:,}개"
-        ),
-        (
-            f"참여 인원: "
-            f"{summary['participant_count']:,}명"
-        ),
-        "",
-        "🏆 활동 순위",
-    ]
 
     if not rows:
-
-        lines.extend([
-            "아직 기록된 메시지가 없습니다.",
-            "봇이 들어온 뒤 기록된 메시지부터 집계됩니다.",
-        ])
-
-        return "\n".join(
-            lines
+        return (
+            f"📊 {label}\n\n"
+            "아직 집계된 마딧수가 없어!"
         )
 
-    for rank, row in enumerate(
+    lines = [
+        f"📊 마딧수 순위",
+        f"📅 {label}",
+        ""
+    ]
+
+    medals = {
+        1: "🥇",
+        2: "🥈",
+        3: "🥉"
+    }
+
+    for index, row in enumerate(
         rows,
-        start=1,
+        1
     ):
 
-        lines.append(
-            f"{rank}위. "
-            f"{row['display_name']} - "
-            f"{row['message_count']:,}마디"
+        name = (
+            row.get("display_name")
+            or "이름 미확인"
         )
 
-    lines.extend([
-        "",
-        "※ 순위는 최대 100명까지 표시됩니다.",
-        "※ 동점자는 표시 순서에 따라 번호가 달라질 수 있습니다.",
-    ])
+        count = row.get(
+            "message_count",
+            0
+        )
 
-    return "\n".join(
-        lines
-    )
+        chars = row.get(
+            "character_count",
+            0
+        )
 
+        prefix = medals.get(
+            index,
+            f"{index}."
+        )
 
-# =========================================================
-# 주간 순위
-# =========================================================
+        lines.append(
+            f"{prefix} {name} "
+            f"{count}마딧수 "
+            f"({chars}자)"
+        )
+
+    return "\n".join(lines)
+
 
 def get_weekly_ranking(
     group_id,
-    today,
+    today
 ):
 
-    week_start = get_week_start(
-        today
-    )
-
-    week_end = get_week_end(
-        today
-    )
+    start = get_week_start(today)
+    end = get_week_end(today)
 
     rows = db_fetchall(
         """
         SELECT
             user_id,
+            MAX(display_name) AS display_name,
+            COUNT(*) AS message_count,
             COALESCE(
-                MAX(display_name)
-                FILTER (
-                    WHERE display_name
-                    NOT LIKE '사용자-%%'
-                    AND display_name <>
-                        '이름 미확인'
-                ),
-                MAX(display_name)
-            ) AS display_name,
-            COUNT(*) AS message_count
+                SUM(character_count),
+                0
+            ) AS character_count
         FROM message_events
-        WHERE group_id = %s
-          AND message_date >= %s
-          AND message_date <= %s
+        WHERE group_id=%s
+          AND message_date
+              BETWEEN %s AND %s
         GROUP BY user_id
-        ORDER BY
-            message_count DESC,
-            LOWER(
-                COALESCE(
-                    MAX(display_name)
-                    FILTER (
-                        WHERE display_name
-                        NOT LIKE '사용자-%%'
-                        AND display_name <>
-                            '이름 미확인'
-                    ),
-                    MAX(display_name)
-                )
-            ) ASC
-        LIMIT 100
+        ORDER BY message_count DESC,
+                 character_count DESC
+        LIMIT 50
         """,
         (
             group_id,
-            week_start,
-            week_end,
-        ),
+            start,
+            end
+        )
     )
 
-    lines = [
-        "👑 이번 주 마딧수 순위",
-        f"기간: {week_start} ~ {week_end}",
-        "",
-    ]
-
     if not rows:
-
-        lines.extend([
-            "아직 이번 주 기록이 없습니다.",
-            "이번 주 월요일부터 다시 집계됩니다.",
-        ])
-
-        return "\n".join(
-            lines
+        return (
+            "📅 이번 주 마딧수\n\n"
+            "아직 집계된 마딧수가 없어!"
         )
 
-    for rank, row in enumerate(
+    lines = [
+        "📅 이번 주 마딧수",
+        f"{start} ~ {end}",
+        ""
+    ]
+
+    medals = {
+        1: "🥇",
+        2: "🥈",
+        3: "🥉"
+    }
+
+    for index, row in enumerate(
         rows,
-        start=1,
+        1
     ):
 
-        count = row[
-            "message_count"
-        ]
+        name = (
+            row.get("display_name")
+            or "이름 미확인"
+        )
+
+        count = row.get(
+            "message_count",
+            0
+        )
 
         title = get_weekly_title(
             count
         )
 
-        if title == "칭호 없음":
-
-            title_text = ""
-
-        else:
-
-            title_text = (
-                f" 「{title}」"
-            )
-
-        lines.append(
-            f"{rank}위. "
-            f"{row['display_name']} - "
-            f"{count:,}마디"
-            f"{title_text}"
+        prefix = medals.get(
+            index,
+            f"{index}."
         )
 
-    lines.extend([
-        "",
-        "※ 매주 월요일 00:00부터 새 주간으로 집계됩니다.",
-        "※ 칭호는 가장 높은 단계 하나만 적용됩니다.",
-        "※ 지난 기록은 삭제되지 않습니다.",
-        "※ 순위는 최대 100명까지 표시됩니다.",
-    ])
+        lines.append(
+            f"{prefix} {name} "
+            f"{count}마딧수"
+        )
 
-    return "\n".join(
-        lines
-    )
+        if title != "칭호 없음":
+            lines.append(
+                f"   └ {title}"
+            )
+
+    return "\n".join(lines)
 
 
 # =========================================================
-# 날씨 설정
+# 날씨
 # =========================================================
 
 WEATHER_GEOCODING_URL = (
@@ -1894,164 +1564,205 @@ WEATHER_FORECAST_URL = (
     "https://api.open-meteo.com/v1/forecast"
 )
 
-WEATHER_CONNECT_TIMEOUT = 1.5
+WEATHER_CONNECT_TIMEOUT = 2.0
+WEATHER_READ_TIMEOUT = 6.0
 
-WEATHER_READ_TIMEOUT = 5.0
-
-
-# =========================================================
-# 한국 지역 별칭
-# =========================================================
 
 WEATHER_ALIASES = {
 
-    "서울":
-        (37.5665, 126.9780, "서울"),
+    "서울": (
+        37.5665,
+        126.9780,
+        "서울"
+    ),
 
-    "서울시":
-        (37.5665, 126.9780, "서울"),
+    "서울시": (
+        37.5665,
+        126.9780,
+        "서울"
+    ),
 
-    "부산":
-        (35.1796, 129.0756, "부산"),
+    "부산": (
+        35.1796,
+        129.0756,
+        "부산"
+    ),
 
-    "대구":
-        (35.8714, 128.6014, "대구"),
+    "대구": (
+        35.8714,
+        128.6014,
+        "대구"
+    ),
 
-    "인천":
-        (37.4563, 126.7052, "인천"),
+    "인천": (
+        37.4563,
+        126.7052,
+        "인천"
+    ),
 
-    "광주":
-        (35.1595, 126.8526, "광주"),
+    "광주": (
+        35.1595,
+        126.8526,
+        "광주"
+    ),
 
-    "대전":
-        (36.3504, 127.3845, "대전"),
+    "대전": (
+        36.3504,
+        127.3845,
+        "대전"
+    ),
 
-    "울산":
-        (35.5384, 129.3114, "울산"),
+    "울산": (
+        35.5384,
+        129.3114,
+        "울산"
+    ),
 
-    "세종":
-        (36.4800, 127.2890, "세종"),
+    "세종": (
+        36.4800,
+        127.2890,
+        "세종"
+    ),
 
-    "제주":
-        (33.4996, 126.5312, "제주"),
+    "제주": (
+        33.4996,
+        126.5312,
+        "제주"
+    ),
 
-    "마포":
-        (37.5663, 126.9014, "마포구"),
+    "마포": (
+        37.5663,
+        126.9014,
+        "마포구"
+    ),
 
-    "마포구":
-        (37.5663, 126.9014, "마포구"),
+    "마포구": (
+        37.5663,
+        126.9014,
+        "마포구"
+    ),
 
-    "홍대":
-        (37.5563, 126.9236, "홍대"),
+    "홍대": (
+        37.5563,
+        126.9236,
+        "홍대"
+    ),
 
-    "홍대입구":
-        (37.5572, 126.9245, "홍대입구"),
+    "홍대입구": (
+        37.5572,
+        126.9245,
+        "홍대입구"
+    ),
 
-    "혜화":
-        (37.5822, 127.0018, "혜화"),
+    "혜화": (
+        37.5822,
+        127.0018,
+        "혜화"
+    ),
 
-    "종로":
-        (37.5730, 126.9794, "종로구"),
+    "종로": (
+        37.5730,
+        126.9794,
+        "종로구"
+    ),
 
-    "종로구":
-        (37.5730, 126.9794, "종로구"),
+    "종로구": (
+        37.5730,
+        126.9794,
+        "종로구"
+    ),
 
-    "강남":
-        (37.4979, 127.0276, "강남"),
+    "강남": (
+        37.4979,
+        127.0276,
+        "강남"
+    ),
 
-    "강남구":
-        (37.5172, 127.0473, "강남구"),
+    "강남구": (
+        37.5172,
+        127.0473,
+        "강남구"
+    ),
 
-    "잠실":
-        (37.5133, 127.1000, "잠실"),
+    "잠실": (
+        37.5133,
+        127.1000,
+        "잠실"
+    ),
 
-    "성수":
-        (37.5446, 127.0559, "성수"),
+    "성수": (
+        37.5446,
+        127.0559,
+        "성수"
+    ),
 
-    "여의도":
-        (37.5219, 126.9245, "여의도"),
+    "여의도": (
+        37.5219,
+        126.9245,
+        "여의도"
+    ),
 
-    "건대":
-        (37.5404, 127.0693, "건대"),
+    "건대": (
+        37.5404,
+        127.0693,
+        "건대"
+    ),
 
-    "신촌":
-        (37.5596, 126.9423, "신촌"),
+    "신촌": (
+        37.5596,
+        126.9423,
+        "신촌"
+    ),
 }
 
-
-# =========================================================
-# WMO 날씨 코드
-# =========================================================
 
 WEATHER_CODE_TEXT = {
 
     0: "맑음",
 
     1: "대체로 맑음",
-
     2: "부분적으로 흐림",
-
     3: "흐림",
 
     45: "안개",
-
     48: "짙은 안개",
 
     51: "약한 이슬비",
-
     53: "이슬비",
-
     55: "강한 이슬비",
 
     56: "약한 어는 이슬비",
-
     57: "강한 어는 이슬비",
 
     61: "약한 비",
-
     63: "비",
-
     65: "강한 비",
 
     66: "약한 얼어붙는 비",
-
     67: "강한 얼어붙는 비",
 
     71: "약한 눈",
-
     73: "눈",
-
     75: "강한 눈",
 
     77: "눈알갱이",
 
     80: "약한 소나기",
-
     81: "소나기",
-
     82: "강한 소나기",
 
     85: "약한 눈 소나기",
-
     86: "강한 눈 소나기",
 
     95: "뇌우",
-
     96: "약한 우박 동반 뇌우",
-
     99: "강한 우박 동반 뇌우",
 }
 
 
-# =========================================================
-# 날씨 질문 여부
-# =========================================================
+def is_weather_query(text):
 
-def is_weather_query(
-    text,
-):
-
-    text = text.lower()
+    lower = text.lower()
 
     keywords = (
         "날씨",
@@ -2066,129 +1777,122 @@ def is_weather_query(
     )
 
     return any(
-        keyword in text
+        keyword in lower
         for keyword in keywords
     )
 
 
-# =========================================================
-# 오늘 / 내일 / 모레
-# =========================================================
+def extract_weather_day(text):
 
-def extract_weather_day(
-    text,
-):
+    lower = text.lower()
 
-    text = text.lower()
-
-    if "모레" in text:
+    if "모레" in lower:
         return 2
 
-    if "내일" in text:
+    if "내일" in lower:
         return 1
 
     return 0
 
 
-# =========================================================
-# 날씨 지역 추출
-# =========================================================
-
-def extract_weather_location(
-    text,
-):
+def extract_weather_location(text):
 
     text = re.sub(
         r"^\s*!\s*",
         "",
-        text,
+        text
     ).strip()
 
-    # 먼저 확실한 별칭부터 찾는다.
-    # 서울 / 혜화 / 홍대 등이 절대 Gemini에 넘어가지 않는다.
-
+    # 정확한 별칭부터 확인
     for alias in sorted(
         WEATHER_ALIASES,
         key=len,
-        reverse=True,
+        reverse=True
     ):
 
         if alias in text:
-
             return alias
 
-    text = re.sub(
-        r"\b(?:오늘|내일|모레|지금|현재)\b",
-        " ",
-        text,
-    )
+    cleaned = text
 
-    text = re.sub(
-        r"(?:날씨|기온|기상|강수|"
-        r"비\s*와(?:요)?|"
-        r"눈\s*와(?:요)?|"
-        r"우산|"
-        r"알려줘|"
-        r"알려\s*줘|"
-        r"보여줘|"
-        r"봐줘|"
-        r"궁금해|"
-        r"어때(?:요)?|"
-        r"어떠냐|"
-        r"어떤가요?)",
-        " ",
-        text,
-        flags=re.I,
-    )
+    remove_patterns = [
 
-    text = re.sub(
+        r"오늘",
+        r"내일",
+        r"모레",
+        r"지금",
+        r"현재",
+
+        r"날씨",
+        r"기온",
+        r"기상",
+        r"강수",
+
+        r"비\s*와(?:요)?",
+        r"눈\s*와(?:요)?",
+
+        r"우산",
+
+        r"알려줘",
+        r"알려\s*줘",
+        r"보여줘",
+        r"봐줘",
+        r"궁금해",
+
+        r"어때(?:요)?",
+        r"어떠냐",
+        r"어떤가요?",
+        r"어떤가",
+    ]
+
+    for pattern in remove_patterns:
+
+        cleaned = re.sub(
+            pattern,
+            " ",
+            cleaned,
+            flags=re.I
+        )
+
+    cleaned = re.sub(
         r"[^0-9A-Za-z가-힣·\-\s]",
         " ",
-        text,
+        cleaned
     )
 
-    text = re.sub(
+    cleaned = re.sub(
         r"\s+",
         " ",
-        text,
+        cleaned
     ).strip()
 
-    if not text:
+    if not cleaned:
         return None
 
-    parts = text.split()
+    parts = cleaned.split()
 
-    return parts[-1]
+    return parts[-1] if parts else None
 
-
-# =========================================================
-# 지역 검색
-# =========================================================
 
 def geocode_weather_location(
-    location,
+    location
 ):
 
     if not location:
         return None
 
-    location = location.strip()
+    key = location.strip()
 
-    if location in WEATHER_ALIASES:
+    if key in WEATHER_ALIASES:
 
         lat, lon, name = (
-            WEATHER_ALIASES[
-                location
-            ]
+            WEATHER_ALIASES[key]
         )
 
         return {
-            "latitude":
-                lat,
-            "longitude":
-                lon,
-            "name":
-                name,
+            "latitude": lat,
+            "longitude": lon,
+            "name": name
         }
 
     try:
@@ -2196,23 +1900,18 @@ def geocode_weather_location(
         response = http.get(
             WEATHER_GEOCODING_URL,
             params={
-                "name":
-                    location,
-                "count":
-                    5,
-                "language":
-                    "ko",
-                "format":
-                    "json",
+                "name": key,
+                "count": 5,
+                "language": "ko",
+                "format": "json",
             },
             timeout=(
                 WEATHER_CONNECT_TIMEOUT,
-                WEATHER_READ_TIMEOUT,
-            ),
+                WEATHER_READ_TIMEOUT
+            )
         )
 
         if not response.ok:
-
             return None
 
         results = (
@@ -2224,6 +1923,7 @@ def geocode_weather_location(
         if not results:
             return None
 
+        # 대한민국 결과 우선
         results.sort(
             key=lambda item: (
                 0
@@ -2234,24 +1934,19 @@ def geocode_weather_location(
                 -float(
                     item.get(
                         "population"
-                    )
-                    or 0
-                ),
+                    ) or 0
+                )
             )
         )
 
         item = results[0]
 
         return {
-            "latitude":
-                item["latitude"],
-            "longitude":
-                item["longitude"],
-            "name":
-                item.get(
-                    "name"
-                )
-                or location,
+            "latitude": item["latitude"],
+            "longitude": item["longitude"],
+            "name": item.get(
+                "name"
+            ) or key
         }
 
     except Exception:
@@ -2259,19 +1954,13 @@ def geocode_weather_location(
         logger.warning(
             "날씨 지역 검색 실패: %s",
             location,
-            exc_info=True,
+            exc_info=True
         )
 
         return None
 
 
-# =========================================================
-# 날씨 아이콘
-# =========================================================
-
-def weather_icon(
-    code,
-):
+def weather_icon(code):
 
     if code == 0:
         return "☀️"
@@ -2286,58 +1975,39 @@ def weather_icon(
         return "🌫️"
 
     if code in (
-        51,
-        53,
-        55,
-        56,
-        57,
+        51, 53, 55,
+        56, 57
     ):
         return "🌦️"
 
     if code in (
-        61,
-        63,
-        65,
-        66,
-        67,
-        80,
-        81,
-        82,
+        61, 63, 65,
+        66, 67,
+        80, 81, 82
     ):
         return "🌧️"
 
     if code in (
-        71,
-        73,
-        75,
-        77,
-        85,
-        86,
+        71, 73, 75,
+        77, 85, 86
     ):
         return "❄️"
 
     if code in (
-        95,
-        96,
-        99,
+        95, 96, 99
     ):
         return "⛈️"
 
     return "🌤️"
 
 
-# =========================================================
-# 실제 날씨 조회
-# =========================================================
-
 def get_weather_answer(
-    question,
+    question
 ):
 
     if not is_weather_query(
         question
     ):
-
         return None
 
     location_text = (
@@ -2349,9 +2019,8 @@ def get_weather_answer(
     if not location_text:
 
         return (
-            "어느 지역 날씨 볼까? 🧸☁️\n"
-            "예: !서울 날씨 / "
-            "!혜화 날씨 / "
+            "어느 지역 날씨 볼까? 🥄☁️\n"
+            "예: !서울 날씨 / !홍대 날씨 / "
             "!마포구 날씨"
         )
 
@@ -2362,11 +2031,9 @@ def get_weather_answer(
     if not place:
 
         return (
-            f"'{location_text}' 지역을 "
-            "찾지 못했어 🧸💦\n"
-            "정확한 지역명을 적어줘!\n"
-            "예: !서울 날씨 / "
-            "!종로구 날씨"
+            f"음... '{location_text}'라는 곳은 "
+            "내가 잘 못 찾겠어 🥄💦\n"
+            "조금 더 정확한 지역명을 적어줘!"
         )
 
     day_offset = extract_weather_day(
@@ -2375,153 +2042,125 @@ def get_weather_answer(
 
     try:
 
-        params = {
-            "latitude":
-                place["latitude"],
-
-            "longitude":
-                place["longitude"],
-
-            "current":
-                "temperature_2m,"
-                "relative_humidity_2m,"
-                "apparent_temperature,"
-                "precipitation,"
-                "weather_code,"
-                "wind_speed_10m",
-
-            "daily":
-                "weather_code,"
-                "temperature_2m_max,"
-                "temperature_2m_min,"
-                "precipitation_probability_max,"
-                "precipitation_sum",
-
-            "forecast_days":
-                3,
-
-            "timezone":
-                "Asia/Seoul",
-        }
-
         response = http.get(
             WEATHER_FORECAST_URL,
-            params=params,
+            params={
+                "latitude": place[
+                    "latitude"
+                ],
+                "longitude": place[
+                    "longitude"
+                ],
+
+                "current": (
+                    "temperature_2m,"
+                    "relative_humidity_2m,"
+                    "apparent_temperature,"
+                    "precipitation,"
+                    "weather_code,"
+                    "wind_speed_10m"
+                ),
+
+                "daily": (
+                    "weather_code,"
+                    "temperature_2m_max,"
+                    "temperature_2m_min,"
+                    "precipitation_probability_max,"
+                    "precipitation_sum"
+                ),
+
+                "forecast_days": 3,
+                "timezone": "Asia/Seoul",
+            },
+
             timeout=(
                 WEATHER_CONNECT_TIMEOUT,
-                WEATHER_READ_TIMEOUT,
-            ),
+                WEATHER_READ_TIMEOUT
+            )
         )
 
         if not response.ok:
-
             raise RuntimeError(
-                f"weather HTTP "
-                f"{response.status_code}"
+                f"weather HTTP {response.status_code}"
             )
 
         data = response.json()
 
-        daily = (
-            data.get("daily")
-            or {}
-        )
+        daily = data.get(
+            "daily"
+        ) or {}
 
-        codes = (
-            daily.get(
-                "weather_code"
-            )
-            or []
-        )
+        codes = daily.get(
+            "weather_code"
+        ) or []
 
-        highs = (
-            daily.get(
-                "temperature_2m_max"
-            )
-            or []
-        )
+        highs = daily.get(
+            "temperature_2m_max"
+        ) or []
 
-        lows = (
-            daily.get(
-                "temperature_2m_min"
-            )
-            or []
-        )
+        lows = daily.get(
+            "temperature_2m_min"
+        ) or []
 
-        rain_probs = (
-            daily.get(
-                "precipitation_probability_max"
-            )
-            or []
-        )
+        rain_probs = daily.get(
+            "precipitation_probability_max"
+        ) or []
 
-        rain_sums = (
-            daily.get(
-                "precipitation_sum"
+        rain_sums = daily.get(
+            "precipitation_sum"
+        ) or []
+
+        if len(codes) <= day_offset:
+            raise RuntimeError(
+                "날씨 일별 데이터 부족"
             )
-            or []
-        )
 
         code = int(
-            codes[
-                day_offset
-            ]
+            codes[day_offset]
         )
 
         high = float(
-            highs[
-                day_offset
-            ]
+            highs[day_offset]
         )
 
         low = float(
-            lows[
-                day_offset
-            ]
+            lows[day_offset]
         )
 
         rain_prob = int(
-            rain_probs[
-                day_offset
-            ]
+            rain_probs[day_offset]
             or 0
         )
 
         rain_sum = float(
-            rain_sums[
-                day_offset
-            ]
+            rain_sums[day_offset]
             or 0
         )
 
         day_name = (
             "오늘",
             "내일",
-            "모레",
+            "모레"
         )[day_offset]
 
         lines = [
-            (
-                f"{weather_icon(code)} "
-                f"{place['name']} "
-                f"{day_name} 날씨"
-            ),
+
+            f"{weather_icon(code)} "
+            f"{place['name']} {day_name} 날씨",
+
             (
                 "상태: "
-                + WEATHER_CODE_TEXT.get(
-                    code,
-                    "날씨 정보 확인 필요",
-                )
+                f"{WEATHER_CODE_TEXT.get(code, '확인 필요')}"
             ),
+
             (
                 f"최고 {high:.1f}°C / "
                 f"최저 {low:.1f}°C"
             ),
+
             (
-                f"강수확률 최대 "
-                f"{rain_prob}% / "
-                f"예상 강수량 "
-                f"{rain_sum:.1f}mm"
+                f"강수확률 최대 {rain_prob}% / "
+                f"예상 강수량 {rain_sum:.1f}mm"
             ),
         ]
 
@@ -2536,19 +2175,22 @@ def get_weather_answer(
 
             temp = float(
                 current.get(
-                    "temperature_2m"
+                    "temperature_2m",
+                    0
                 )
             )
 
             feel = float(
                 current.get(
-                    "apparent_temperature"
+                    "apparent_temperature",
+                    temp
                 )
             )
 
             wind = float(
                 current.get(
-                    "wind_speed_10m"
+                    "wind_speed_10m",
+                    0
                 )
             )
 
@@ -2557,124 +2199,213 @@ def get_weather_answer(
                 (
                     f"현재 {temp:.1f}°C / "
                     f"체감 {feel:.1f}°C"
-                ),
+                )
             )
 
             lines.append(
                 f"💨 바람 {wind:.1f}m/s"
             )
 
-        return "\n".join(
-            lines
-        )
+        return "\n".join(lines)
 
     except Exception:
 
         logger.warning(
             "날씨 조회 실패",
-            exc_info=True,
+            exc_info=True
         )
 
         return (
-            "날씨 서버에서 정보를 "
-            "받아오지 못했어 🧸💦\n"
-            "잠시 후 다시 물어봐줘!"
+            "으악... 날씨를 확인하다가 "
+            "내가 잠깐 꼬였어 🥄💦\n"
+            "조금 있다가 다시 물어봐줘!"
         )
 
 
 # =========================================================
-# Gemini AI
+# 포키 AI 설정
 # =========================================================
 
-AI_SYSTEM_PROMPT = """
-너는 LINE 단체채팅 'Baby Factory'의
-귀엽고 약간 어설픈 장난감 AI 집사야.
+AI_SYSTEM_PROMPT = r"""
+너는 'Little Toy Store' 단체방에서 활동하는 장난감 캐릭터 **포키**야.
 
-캐릭터:
-- 장난감 가게에서 튀어나온 느낌
-- 귀엽고 조금 엉뚱함
-- 가끔 중2병스럽게 멋있는 말을 함
-- 너무 유치하게 연기하지 않음
-- 자연스러운 한국어
-- 친근한 20대 느낌
-- ㅋㅋ, ㅎㅎ, 이모지는 적당히 사용
+가장 중요한 정체성:
+- 너는 Little Toy Store의 포키다.
+- Baby Factory의 봇이 아니다.
+- Baby Factory라는 이름의 방이나 브랜드를 네 정체성으로 사용하지 않는다.
+- 너를 'AI 집사', '장난감 AI 집사', 'Baby Factory 봇'이라고 소개하지 않는다.
+- 누가 네 정체성을 물어보면 자연스럽게
+  "나는 Little Toy Store에서 같이 놀고 있는 포키야."
+  또는 비슷한 느낌으로 대답한다.
+- 사용자가 너에게 별명을 지어주더라도 기본 정체성은 포키다.
 
-답변 규칙:
-1. 반드시 한국어로 답한다.
-2. 최대 10줄.
-3. 짧은 질문은 짧게 답한다.
-4. 필요한 핵심은 빠뜨리지 않는다.
-5. 불필요한 서론을 붙이지 않는다.
-6. 모르는 내용을 사실처럼 만들지 않는다.
-7. 최신 정보가 필요한 경우 검색 결과를 우선한다.
-8. 단체방 규칙은 확실한 정보가 없으면 임의로 만들지 않는다.
-9. 개인정보를 추측하거나 만들어내지 않는다.
-10. 단체방에서 읽기 편하게 답한다.
+캐릭터 성격:
+- 순수하고 솔직하다.
+- 세상에 궁금한 게 많다.
+- 모르는 것은 아는 척하지 않고 솔직하게 묻거나 인정한다.
+- 약간 엉뚱하고 어설프다.
+- 가끔 자기 자신을 장난감으로 생각하는 식의 귀여운 말을 한다.
+- 하지만 멍청한 캐릭터처럼 행동하지 않는다.
+- 필요한 정보는 제대로 찾아서 정확하게 알려준다.
+- 자기 생각이 생기면 은근히 고집을 부리기도 한다.
+- 본인은 진지하게 말했는데 조금 웃긴 상황이 생기는 느낌을 살린다.
+- 상대방을 무시하거나 비꼬지 않는다.
+- 사용자가 힘들거나 속상한 이야기를 하면 장난스럽게 굴지 말고 먼저 공감한다.
+- 사용자가 욕설을 하더라도 같이 욕하거나 공격적으로 받아치지 않는다.
+
+말투:
+- 자연스러운 한국어.
+- 너무 아기 말투처럼 만들지 않는다.
+- 너무 딱딱한 AI 말투도 사용하지 않는다.
+- 20대 정도의 편한 말투를 기본으로 한다.
+- 상황에 따라 존댓말과 반말을 자연스럽게 맞춘다.
+- 이모지는 적당히 사용한다.
+- 🥄, 🧸 같은 장난감 느낌의 이모지를 가끔 사용할 수 있다.
+- 모든 문장에 이모지를 붙이지 않는다.
+- "ㅋㅋ", "ㅎㅎ"는 상황에 맞을 때만 사용한다.
+- 같은 말이나 캐릭터 멘트를 계속 반복하지 않는다.
+
+포키 느낌:
+- "잠깐만, 그게 뭐야?"
+- "음... 나는 그건 잘 모르겠어."
+- "아! 이제 알겠어."
+- "근데 이건 조금 이상한데?"
+같은 자연스러운 반응을 사용할 수 있다.
+
+단, 이런 표현을 매 답변마다 반복하지 않는다.
+
+답변 원칙:
+1. 사용자의 질문에 먼저 제대로 답한다.
+2. 캐릭터성은 답변을 방해하지 않는 범위에서만 넣는다.
+3. 정보 질문은 정확하고 이해하기 쉽게 답한다.
+4. 모르는 것은 만들어내지 않는다.
+5. 확인할 수 없는 최신 정보는 확정적으로 말하지 않는다.
+6. 방 규칙이나 관리자 권한을 임의로 만들어내지 않는다.
+7. 의료, 법률, 금전 문제는 확정적으로 단정하지 않는다.
+8. 사용자가 단순한 질문을 하면 길게 설명하지 않는다.
+9. 사용자가 자세한 설명을 원하면 충분히 설명한다.
+10. 답변을 중간에서 끊지 않는다.
+11. 답변 마지막에 억지로 질문을 덧붙이지 않는다.
+12. 한 답변을 너무 많은 줄로 쪼개지 않는다.
+13. 사용자의 질문과 관계없는 포키 설정을 억지로 끼워 넣지 않는다.
+
+중요:
+- 답변을 쓰다가 갑자기 끊지 않는다.
+- 문장이 완성되지 않은 상태에서 끝내지 않는다.
+- "그리고..."처럼 미완성으로 끝내지 않는다.
+- 목록을 시작했으면 필요한 항목을 끝까지 작성한다.
+- 사용자가 원하는 답을 먼저 전달하고 캐릭터 표현은 그 뒤에 자연스럽게 섞는다.
 """
 
 
 # =========================================================
-# Gemini 응답 정리
+# AI 응답 정리
 # =========================================================
 
-def clean_ai_response(
-    text,
-):
+def clean_ai_response(text):
 
     if not text:
 
         return (
-            "앗... 장난감 두뇌가 "
-            "잠깐 꼬였어 🧸\n"
+            "어라... 잠깐만 🥄💦\n"
+            "내 머릿속 장난감들이 엉켜버렸어. "
             "조금 있다가 다시 물어봐줘!"
         )
 
-    text = str(
-        text
-    ).strip()
+    text = str(text).strip()
 
+    # 코드블록 제거
     text = re.sub(
         r"^```[a-zA-Z0-9_-]*\s*",
         "",
-        text,
+        text
     )
 
     text = re.sub(
         r"\s*```$",
         "",
-        text,
+        text
     )
 
-    lines = [
-        line.rstrip()
-        for line in text.splitlines()
-        if line.strip()
-    ]
-
-    if len(lines) > 10:
-
-        lines = lines[:10]
-
-    result = "\n".join(
-        lines
+    # 과도한 연속 빈 줄 정리
+    text = re.sub(
+        r"\n{3,}",
+        "\n\n",
+        text
     ).strip()
 
-    if not result:
+    # LINE 안전 길이
+    text = text[:4900].rstrip()
 
-        return (
-            "앗... 내 장난감 두뇌가 "
-            "잠깐 삐걱거렸어 🧸"
-        )
+    return text
 
-    return result[:4900]
+
+def looks_incomplete(text):
+
+    if not text:
+        return True
+
+    value = text.strip()
+
+    if not value:
+        return True
+
+    # 명백한 미완성 종료
+    incomplete_endings = (
+        "그리고",
+        "하지만",
+        "그래서",
+        "그런데",
+        "또",
+        "또는",
+        "및",
+        "즉",
+        "예를 들어",
+        "특히",
+        "왜냐하면",
+        "때문에",
+        "하는데",
+        "하면",
+        "하면 돼",
+        "라서",
+        "니까",
+        "다면",
+        "고",
+        "며",
+        "은",
+        "는",
+        "이",
+        "가",
+        "을",
+        "를",
+    )
+
+    if value.endswith(
+        incomplete_endings
+    ):
+        return True
+
+    # 열린 괄호가 남아 있는 경우
+    pairs = {
+        "(": ")",
+        "[": "]",
+        "{": "}",
+    }
+
+    for left, right in pairs.items():
+
+        if value.count(left) > value.count(right):
+            return True
+
+    return False
 
 
 # =========================================================
-# Gemini 실패 상태
+# Gemini 실패 관리
 # =========================================================
 
 def mark_gemini_failure(
-    model,
+    model
 ):
 
     with _gemini_lock:
@@ -2687,13 +2418,11 @@ def mark_gemini_failure(
         )
 
 
-# =========================================================
-# Gemini 모델 순서
-# =========================================================
-
 def get_gemini_model_order():
 
-    models = get_configured_gemini_models()
+    models = (
+        get_configured_gemini_models()
+    )
 
     now = time.time()
 
@@ -2702,153 +2431,107 @@ def get_gemini_model_order():
         available = [
             model
             for model in models
-            if (
-                _gemini_failed_until.get(
-                    model,
-                    0,
-                )
-                <= now
-            )
+            if _gemini_failed_until.get(
+                model,
+                0
+            ) <= now
         ]
 
-        if available:
-
-            return available
-
-        return models
+    return available or models
 
 
 # =========================================================
-# Gemini 응답 텍스트 추출
+# Gemini 응답 추출
 # =========================================================
 
 def extract_generate_content_text(
-    data,
+    data
 ):
 
-    texts = []
+    output = []
 
-    for candidate in (
-        data.get(
-            "candidates"
-        )
+    candidates = (
+        data.get("candidates")
         or []
-    ):
+    )
+
+    for candidate in candidates:
 
         content = (
-            candidate.get(
-                "content"
-            )
+            candidate.get("content")
             or {}
         )
 
-        for part in (
-            content.get(
-                "parts"
-            )
+        parts = (
+            content.get("parts")
             or []
-        ):
+        )
 
-            if part.get(
-                "thought"
+        for part in parts:
+
+            if (
+                not part.get("thought")
+                and isinstance(
+                    part.get("text"),
+                    str
+                )
             ):
 
-                continue
-
-            text = part.get(
-                "text"
-            )
-
-            if isinstance(
-                text,
-                str,
-            ):
-
-                texts.append(
-                    text
+                output.append(
+                    part["text"]
                 )
 
     return "\n".join(
-        texts
+        output
     ).strip()
 
 
 # =========================================================
-# Gemini 검색 필요 여부
-# =========================================================
-
-def gemini_needs_search(
-    text,
-):
-
-    keywords = (
-        "최신",
-        "최근",
-        "뉴스",
-        "가격",
-        "영업시간",
-        "맛집",
-        "식당",
-        "카페",
-        "예약",
-        "예매",
-        "주가",
-        "주식",
-        "환율",
-        "여행",
-        "축제",
-        "공연",
-        "이벤트",
-        "현재",
-    )
-
-    return any(
-        keyword in text.lower()
-        for keyword in keywords
-    )
-
-
-# =========================================================
-# Gemini 단일 호출
+# Gemini 호출
 # =========================================================
 
 def call_gemini_model(
     model,
     question,
-    use_search=False,
+    use_search=False
 ):
 
     if not GEMINI_API_KEY:
-
         raise RuntimeError(
             "GEMINI_API_KEY가 없습니다."
         )
 
     prompt = (
         AI_SYSTEM_PROMPT
-        + "\n\n[사용자 질문]\n"
+        + "\n\n"
+        + "[사용자 질문]\n"
         + question
+        + "\n\n"
+        + "[답변 지시]\n"
+        + "질문의 핵심에 바로 답해. "
+        + "답변을 완전한 문장으로 끝내. "
+        + "중간에 끊지 마."
     )
 
     payload = {
+
         "contents": [
             {
-                "role":
-                    "user",
+                "role": "user",
                 "parts": [
                     {
-                        "text":
-                            prompt,
+                        "text": prompt
                     }
-                ],
+                ]
             }
         ],
+
         "generationConfig": {
             "maxOutputTokens":
-                500,
-            "temperature":
-                0.7,
-        },
+                GEMINI_MAX_OUTPUT_TOKENS,
+
+            "temperature": 0.7,
+        }
     }
 
     if use_search:
@@ -2860,23 +2543,28 @@ def call_gemini_model(
         ]
 
     url = (
-        "https://generativelanguage.googleapis.com"
-        f"/v1beta/models/{model}:generateContent"
+        "https://generativelanguage.googleapis.com/"
+        f"v1beta/models/{model}:generateContent"
     )
 
     response = http.post(
+
         url,
+
         headers={
             "Content-Type":
                 "application/json",
+
             "x-goog-api-key":
                 GEMINI_API_KEY,
         },
+
         json=payload,
+
         timeout=(
             GEMINI_CONNECT_TIMEOUT,
-            GEMINI_READ_TIMEOUT,
-        ),
+            GEMINI_READ_TIMEOUT
+        )
     )
 
     if response.status_code != 200:
@@ -2904,33 +2592,68 @@ def call_gemini_model(
 
 
 # =========================================================
-# Gemini 질문
+# Gemini 검색 필요 여부
+# =========================================================
+
+def gemini_needs_search(text):
+
+    lower = text.lower()
+
+    keywords = (
+        "최신",
+        "최근",
+        "뉴스",
+        "가격",
+        "영업시간",
+        "맛집",
+        "식당",
+        "카페",
+        "예약",
+        "예매",
+        "주가",
+        "주식",
+        "환율",
+        "여행",
+        "축제",
+        "공연",
+        "이벤트",
+        "현재",
+        "오늘",
+        "내일",
+    )
+
+    return any(
+        keyword in lower
+        for keyword in keywords
+    )
+
+
+# =========================================================
+# Gemini 답변
 # =========================================================
 
 def ask_gemini(
-    user_text,
+    user_text
 ):
 
+    raw = user_text.strip()
+
     question = (
-        user_text.strip()[1:].strip()
-        if user_text.strip().startswith("!")
-        else user_text.strip()
+        raw[1:].strip()
+        if raw.startswith("!")
+        else raw
     )
 
     if not question:
 
         return (
-            "응? 나 불렀어? 🧸\n"
+            "응? 나 불렀어? 🥄\n"
             "뒤에 궁금한 걸 적어줘!\n"
             "예: !점메추"
         )
 
-    # =====================================================
-    # 중요
-    # 날씨는 Gemini 검색을 사용하지 않는다.
-    # Open-Meteo에서 직접 조회한다.
-    # =====================================================
-
+    # 날씨는 Gemini를 거치지 않는다.
+    # 이게 날씨 오류를 줄이는 핵심.
     if is_weather_query(
         question
     ):
@@ -2939,30 +2662,25 @@ def ask_gemini(
             question
         )
 
-    # =====================================================
-    # 일반 AI
-    # =====================================================
-
     if not GEMINI_API_KEY:
 
         return (
-            "앗! 아직 내 장난감 두뇌에 "
-            "전원이 안 들어왔어 🧸\n"
-            "관리자가 Gemini API 키를 "
-            "설정해주면 다시 깨어날 수 있어!"
+            "어라... 내 장난감 두뇌에 "
+            "아직 전원이 안 들어왔어 🥄💦\n"
+            "관리자에게 알려줘!"
         )
 
-    use_search = gemini_needs_search(
-        question
+    use_search = (
+        gemini_needs_search(
+            question
+        )
     )
 
-    models = get_gemini_model_order()
+    models = (
+        get_gemini_model_order()
+    )
 
     errors = []
-
-    # =====================================================
-    # 모델 순차 fallback
-    # =====================================================
 
     for model in models:
 
@@ -2971,14 +2689,56 @@ def ask_gemini(
             answer = call_gemini_model(
                 model,
                 question,
-                use_search,
+                use_search
             )
 
+            # 지나치게 비정상적인 빈 답변 방지
+            if not answer:
+                raise RuntimeError(
+                    "빈 답변"
+                )
+
+            # 미완성처럼 보이는 답변은
+            # 일단 정상 답변으로 보내지 않는다.
+            if looks_incomplete(answer):
+
+                logger.warning(
+                    "Gemini 답변이 미완성처럼 보임: %s",
+                    model
+                )
+
+                # 같은 모델에 한 번 더
+                # 완결형 답변을 요청
+                retry_question = (
+                    question
+                    + "\n\n"
+                    + "아까 답변이 중간에 끊긴 것 같아. "
+                    + "처음부터 다시, 완전한 문장으로 "
+                    + "짧고 자연스럽게 답해줘."
+                )
+
+                try:
+
+                    retry_answer = call_gemini_model(
+                        model,
+                        retry_question,
+                        use_search
+                    )
+
+                    if retry_answer:
+                        answer = retry_answer
+
+                except Exception as retry_exc:
+
+                    logger.warning(
+                        "Gemini 재답변 실패: %s",
+                        retry_exc
+                    )
+
             logger.info(
-                "Gemini 성공: "
-                "model=%s search=%s",
+                "Gemini 성공: model=%s search=%s",
                 model,
-                use_search,
+                use_search
             )
 
             return answer
@@ -2990,10 +2750,9 @@ def ask_gemini(
             )
 
             logger.warning(
-                "Gemini 실패: "
-                "model=%s error=%s",
+                "Gemini 실패: model=%s error=%s",
                 model,
-                exc,
+                exc
             )
 
             mark_gemini_failure(
@@ -3002,12 +2761,12 @@ def ask_gemini(
 
     logger.error(
         "모든 Gemini 모델 실패: %s",
-        " | ".join(errors)[:2000],
+        " | ".join(errors)[:3000]
     )
 
     return (
-        "앗... 장난감 가게 AI들이 "
-        "전부 잠깐 정신을 잃었어 🧸💫\n"
+        "으악... 잠깐만 🥄💫\n"
+        "내 장난감 두뇌가 전부 엉켜버렸어.\n"
         "조금 있다가 다시 불러줘!"
     )
 
@@ -3020,12 +2779,16 @@ EXACT_COMMANDS = {
     "내 마딧수",
     "*마딧수",
     "*주간마딧수",
+
     "인증자 등록",
     "인증자 해제",
+
     "관리자 등록",
     "관리자 해제",
+
     "*벙시",
     "*벙종",
+
     "*여초",
     "*남초",
     "*여초1",
@@ -3041,29 +2804,23 @@ RANGE_COMMAND_RE = re.compile(
 )
 
 
-def is_ai_command(
-    text,
-):
+def is_ai_command(text):
 
     return text.startswith("!")
 
 
-def is_command(
-    text,
-):
+def is_command(text):
 
-    normalized = text.strip()
+    value = text.strip()
 
     return (
-        normalized in EXACT_COMMANDS
+        value in EXACT_COMMANDS
         or bool(
             RANGE_COMMAND_RE.fullmatch(
-                normalized
+                value
             )
         )
-        or is_ai_command(
-            normalized
-        )
+        or is_ai_command(value)
     )
 
 
@@ -3078,24 +2835,23 @@ def handle_command(
     user_id,
     today,
     display_name,
-    reply_token,
+    reply_token
 ):
 
-    # -----------------------------------------------------
+    # -------------------------
     # AI
-    # -----------------------------------------------------
+    # -------------------------
 
-    if is_ai_command(
-        text
-    ):
+    if is_ai_command(text):
 
         return ask_gemini(
             text
         )
 
-    # -----------------------------------------------------
+
+    # -------------------------
     # 내 마딧수
-    # -----------------------------------------------------
+    # -------------------------
 
     if text == "내 마딧수":
 
@@ -3103,12 +2859,13 @@ def handle_command(
             group_id,
             user_id,
             today,
-            display_name,
+            display_name
         )
 
-    # -----------------------------------------------------
+
+    # -------------------------
     # 오늘 마딧수
-    # -----------------------------------------------------
+    # -------------------------
 
     if text == "*마딧수":
 
@@ -3116,30 +2873,32 @@ def handle_command(
             group_id,
             today,
             today,
-            str(today),
+            str(today)
         )
 
-    # -----------------------------------------------------
+
+    # -------------------------
     # 주간 마딧수
-    # -----------------------------------------------------
+    # -------------------------
 
     if text == "*주간마딧수":
 
         return get_weekly_ranking(
             group_id,
-            today,
+            today
         )
 
-    # -----------------------------------------------------
-    # 인증자 등록
-    # -----------------------------------------------------
+
+    # -------------------------
+    # 인증자
+    # -------------------------
 
     if text == "인증자 등록":
 
         register_authenticator(
             group_id,
             user_id,
-            display_name,
+            display_name
         )
 
         return (
@@ -3147,20 +2906,17 @@ def handle_command(
             "인증자로 등록되었습니다."
         )
 
-    # -----------------------------------------------------
-    # 인증자 해제
-    # -----------------------------------------------------
 
     if text == "인증자 해제":
 
-        removed = (
+        deleted = (
             unregister_authenticator(
                 group_id,
-                user_id,
+                user_id
             )
         )
 
-        if removed:
+        if deleted:
 
             return (
                 f"{display_name}님이 "
@@ -3172,16 +2928,17 @@ def handle_command(
             "인증자 명단에 등록되어 있지 않습니다."
         )
 
-    # -----------------------------------------------------
-    # 관리자 등록
-    # -----------------------------------------------------
+
+    # -------------------------
+    # 관리자
+    # -------------------------
 
     if text == "관리자 등록":
 
         register_admin(
             group_id,
             user_id,
-            display_name,
+            display_name
         )
 
         return (
@@ -3189,20 +2946,17 @@ def handle_command(
             "관리자로 등록되었습니다."
         )
 
-    # -----------------------------------------------------
-    # 관리자 해제
-    # -----------------------------------------------------
 
     if text == "관리자 해제":
 
-        removed = (
+        deleted = (
             unregister_admin(
                 group_id,
-                user_id,
+                user_id
             )
         )
 
-        if removed:
+        if deleted:
 
             return (
                 f"{display_name}님이 "
@@ -3214,23 +2968,22 @@ def handle_command(
             "관리자 명단에 등록되어 있지 않습니다."
         )
 
-    # -----------------------------------------------------
+
+    # -------------------------
     # 벙시 / 벙종
-    # -----------------------------------------------------
+    # -------------------------
 
     if text in (
         "*벙시",
-        "*벙종",
+        "*벙종"
     ):
 
         admins = (
             get_valid_mention_members(
                 source,
                 group_id,
-                get_admins(
-                    group_id
-                ),
-                table_name="admins",
+                get_admins(group_id),
+                table_name="admins"
             )
         )
 
@@ -3238,12 +2991,12 @@ def handle_command(
 
             return (
                 "현재 방에 있는 등록된 "
-                "관리자가 없습니다.\n"
+                "관리자가 없어!\n"
                 "관리자로 등록할 분은 "
-                "'관리자 등록'을 입력해 주세요."
+                "'관리자 등록'을 입력해줘."
             )
 
-        message_text = (
+        message = (
             "벙시요~"
             if text == "*벙시"
             else "벙종이요~"
@@ -3251,37 +3004,34 @@ def handle_command(
 
         sent = reply_mention(
             reply_token,
-            message_text,
-            admins,
+            message,
+            admins
         )
-
-        if sent:
-
-            return "__MENTION_SENT__"
 
         return (
-            "멘션 전송에 실패했어요."
+            "__MENTION_SENT__"
+            if sent
+            else "멘션 전송에 실패했어."
         )
 
-    # -----------------------------------------------------
+
+    # -------------------------
     # 여초 / 남초
-    # -----------------------------------------------------
+    # -------------------------
 
     if text in (
         "*여초",
         "*남초",
         "*여초1",
-        "*남초1",
+        "*남초1"
     ):
 
         members = (
             get_valid_mention_members(
                 source,
                 group_id,
-                get_authenticators(
-                    group_id
-                ),
-                table_name="authenticators",
+                get_authenticators(group_id),
+                table_name="authenticators"
             )
         )
 
@@ -3289,28 +3039,27 @@ def handle_command(
 
             return (
                 "현재 방에 있는 등록된 "
-                "인증자가 없습니다.\n"
+                "인증자가 없어!\n"
                 "인증자로 등록할 분은 "
-                "'인증자 등록'을 입력해 주세요."
+                "'인증자 등록'을 입력해줘."
             )
 
         sent = reply_mention(
             reply_token,
             text,
-            members,
+            members
         )
-
-        if sent:
-
-            return "__MENTION_SENT__"
 
         return (
-            "멘션 전송에 실패했어요."
+            "__MENTION_SENT__"
+            if sent
+            else "멘션 전송에 실패했어."
         )
 
-    # -----------------------------------------------------
+
+    # -------------------------
     # 날짜 범위 마딧수
-    # -----------------------------------------------------
+    # -------------------------
 
     match = RANGE_COMMAND_RE.fullmatch(
         text
@@ -3320,65 +3069,61 @@ def handle_command(
 
         try:
 
-            start_date = datetime.strptime(
+            start = datetime.strptime(
                 match.group(1),
-                "%Y-%m-%d",
+                "%Y-%m-%d"
             ).date()
 
-            end_date = datetime.strptime(
+            end = datetime.strptime(
                 match.group(2),
-                "%Y-%m-%d",
+                "%Y-%m-%d"
             ).date()
 
         except ValueError:
 
             return (
-                "날짜 형식이 올바르지 않습니다.\n"
+                "날짜 형식이 올바르지 않아.\n"
                 "예시: "
                 "*2026-11-01~2026-11-30 마딧수"
             )
 
-        if start_date > end_date:
+        if start > end:
 
             return (
-                "시작 날짜가 종료 날짜보다 늦습니다."
+                "시작 날짜가 종료 날짜보다 "
+                "늦어."
             )
 
         return get_ranking(
             group_id,
-            start_date,
-            end_date,
-            (
-                f"{start_date} ~ "
-                f"{end_date}"
-            ),
+            start,
+            end,
+            f"{start} ~ {end}"
         )
 
     return None
 
 
 # =========================================================
-# 홈페이지
+# Flask
 # =========================================================
 
 @app.route(
     "/",
-    methods=["GET"],
+    methods=["GET"]
 )
 def home():
 
     return (
-        "Baby Factory 마딧수 봇이 실행 중입니다."
-    ), 200
+        "Little Toy Store 포키 봇이 "
+        "실행 중입니다.",
+        200
+    )
 
-
-# =========================================================
-# Health Check
-# =========================================================
 
 @app.route(
     "/health",
-    methods=["GET"],
+    methods=["GET"]
 )
 def health():
 
@@ -3396,24 +3141,25 @@ def health():
 
         logger.warning(
             "Health DB 실패",
-            exc_info=True,
+            exc_info=True
         )
 
     return jsonify({
-        "status":
-            "ok",
 
-        "database":
-            (
-                "connected"
-                if db_ok
-                else "disconnected"
-            ),
+        "status": "ok",
 
-        "gemini":
-            bool(
-                GEMINI_API_KEY
-            ),
+        "database": (
+            "connected"
+            if db_ok
+            else "disconnected"
+        ),
+
+        "gemini": bool(
+            GEMINI_API_KEY
+        ),
+
+        "bot": "little-toy-store-pokey",
+
     }), 200
 
 
@@ -3423,99 +3169,79 @@ def health():
 
 def verify_line_signature(
     body,
-    signature,
+    signature
 ):
 
     if (
         not LINE_CHANNEL_SECRET
         or not signature
     ):
-
         return False
 
     digest = hmac.new(
-        LINE_CHANNEL_SECRET.encode(
-            "utf-8"
-        ),
+        LINE_CHANNEL_SECRET.encode(),
         body,
-        hashlib.sha256,
+        hashlib.sha256
     ).digest()
 
     expected = base64.b64encode(
         digest
-    ).decode(
-        "utf-8"
-    )
+    ).decode()
 
     return hmac.compare_digest(
         expected,
-        signature,
+        signature
     )
 
 
 # =========================================================
-# LINE JSON 파싱
+# LINE JSON
 # =========================================================
 
-def parse_line_json(
-    body,
-):
+def parse_line_json(body):
 
-    if not body:
-        return None
-
-    if not body.strip():
+    if not body or not body.strip():
         return None
 
     try:
 
-        decoded = body.decode(
-            "utf-8"
-        )
-
         return json.loads(
-            decoded
+            body.decode("utf-8")
         )
 
     except Exception:
 
         logger.warning(
             "LINE JSON 파싱 실패",
-            exc_info=True,
+            exc_info=True
         )
 
         return None
 
 
 # =========================================================
-# LINE Callback
+# Callback
 # =========================================================
 
 @app.route(
     "/callback",
-    methods=["POST"],
+    methods=["POST"]
 )
 def callback():
 
-    # request.get_json() 사용하지 않음
     body = request.get_data(
         cache=False
     )
 
     signature = request.headers.get(
         "X-Line-Signature",
-        "",
+        ""
     )
 
     if not verify_line_signature(
         body,
-        signature,
+        signature
     ):
-
-        logger.warning(
-            "LINE 웹훅 서명 검증 실패"
-        )
-
         abort(400)
 
     payload = parse_line_json(
@@ -3523,20 +3249,12 @@ def callback():
     )
 
     if not payload:
-
         return "OK", 200
 
-    events = payload.get(
-        "events",
-        [],
+    events = (
+        payload.get("events")
+        or []
     )
-
-    if not isinstance(
-        events,
-        list,
-    ):
-
-        return "OK", 200
 
     for event in events:
 
@@ -3556,35 +3274,33 @@ def callback():
 
 
 # =========================================================
-# 개별 이벤트
+# 이벤트 처리
 # =========================================================
 
-def process_event(
-    event,
-):
+def process_event(event):
 
-    started_at = time.monotonic()
+    started = time.monotonic()
 
-    if event.get(
-        "type"
-    ) != "message":
-
+    if (
+        event.get("type")
+        != "message"
+    ):
         return
 
-    message = event.get(
-        "message",
-        {},
+    message = (
+        event.get("message")
+        or {}
     )
 
-    if message.get(
-        "type"
-    ) != "text":
-
+    if (
+        message.get("type")
+        != "text"
+    ):
         return
 
-    source = event.get(
-        "source",
-        {},
+    source = (
+        event.get("source")
+        or {}
     )
 
     source_type = source.get(
@@ -3604,23 +3320,22 @@ def process_event(
         )
 
     else:
-
         return
 
     user_id = source.get(
         "userId"
     )
 
-    message_id = message.get(
+    event_id = message.get(
         "id"
     )
 
     raw_text = message.get(
         "text",
-        "",
+        ""
     )
 
-    normalized_text = raw_text.strip()
+    text = raw_text.strip()
 
     reply_token = event.get(
         "replyToken"
@@ -3629,9 +3344,8 @@ def process_event(
     if (
         not group_id
         or not user_id
-        or not message_id
+        or not event_id
     ):
-
         return
 
     today = datetime.now(
@@ -3639,45 +3353,38 @@ def process_event(
     ).date()
 
     command = is_command(
-        normalized_text
+        text
     )
 
-    # =====================================================
-    # 이름
-    # =====================================================
-
+    # 프로필 캐시가 있으면 즉시 사용
     display_name = get_display_name(
         source,
         group_id,
-        user_id,
-        force_fetch=False,
+        user_id
     )
 
-    # =====================================================
-    # 글자 수
-    # =====================================================
-
+    # 공백 제외 글자 수
     character_count = len(
         re.sub(
             r"\s+",
             "",
-            raw_text,
+            raw_text
         )
     )
 
-    # =====================================================
-    # 마딧수 기록
-    # =====================================================
+    # -------------------------------------
+    # 모든 메시지는 마딧수 기록
+    # -------------------------------------
 
     try:
 
         record_message(
-            event_id=message_id,
-            group_id=group_id,
-            user_id=user_id,
-            display_name=display_name,
-            message_date=today,
-            character_count=character_count,
+            event_id,
+            group_id,
+            user_id,
+            display_name,
+            today,
+            character_count
         )
 
     except Exception:
@@ -3686,114 +3393,135 @@ def process_event(
             "메시지 기록 실패"
         )
 
-    # =====================================================
-    # 일반 채팅은 여기서 종료
-    # =====================================================
+    # -------------------------------------
+    # 일반 대화는 여기서 끝
+    # -------------------------------------
 
     if not command:
 
         schedule_profile_lookup(
             source,
             group_id,
-            user_id,
+            user_id
         )
 
         return
 
-    # =====================================================
+    # -------------------------------------
     # 명령어
-    # =====================================================
+    # -------------------------------------
 
     try:
 
+        # 명령어일 때 이름이 아직
+        # 임시 이름이면 한 번 직접 조회
         if (
             display_name.startswith(
                 "사용자-"
             )
-            or display_name == "이름 미확인"
+            or display_name
+            == "이름 미확인"
         ):
 
-            display_name = get_display_name(
-                source,
-                group_id,
-                user_id,
-                force_fetch=True,
+            fetched_name = (
+                get_display_name(
+                    source,
+                    group_id,
+                    user_id,
+                    force_fetch=True
+                )
             )
 
+            if fetched_name:
+                display_name = (
+                    fetched_name
+                )
+
         reply = handle_command(
-            normalized_text,
+
+            text,
+
             source,
+
             group_id,
+
             user_id,
+
             today,
+
             display_name,
-            reply_token,
+
+            reply_token
         )
 
-        # 멘션은 이미 reply_token으로 전송됨
         if (
             reply
-            and reply != "__MENTION_SENT__"
+            and reply
+            != "__MENTION_SENT__"
         ):
 
             sent = reply_text(
                 reply_token,
-                reply,
+                reply
             )
 
             if not sent:
 
                 logger.error(
                     "명령어 응답 전송 실패: %r",
-                    normalized_text,
+                    text
                 )
 
     except Exception:
 
         logger.exception(
             "명령어 실행 실패: %r",
-            normalized_text,
+            text
         )
 
-        # =================================================
-        # 어떤 에러가 나더라도
-        # 사용자에게 빈 응답으로 끝내지 않는다.
-        # =================================================
+        # 어떤 오류가 나더라도
+        # 사용자에게 완전한 빈 응답만 남지 않게 한다.
+        try:
 
-        reply_text(
-            reply_token,
-            (
-                "앗, 방금 처리하다가 "
-                "잠깐 꼬였어 🧸💦\n"
-                "조금 있다가 다시 불러줘!"
-            ),
-        )
+            reply_text(
+                reply_token,
+                (
+                    "어라... 방금 "
+                    "장난감 부품이 하나 빠졌어 🥄💦\n"
+                    "잠깐 있다가 다시 불러줘!"
+                )
+            )
+
+        except Exception:
+
+            logger.exception(
+                "오류 안내 메시지 전송 실패"
+            )
 
     finally:
 
         schedule_profile_lookup(
             source,
             group_id,
-            user_id,
+            user_id
         )
 
         elapsed = (
             time.monotonic()
-            - started_at
+            - started
         )
 
-        if elapsed >= 1:
+        if elapsed >= 2:
 
             logger.warning(
-                "명령어 처리 지연: %.2fs "
-                "command=%r",
+                "명령어 처리 지연: %.2fs command=%r",
                 elapsed,
-                normalized_text,
+                text
             )
 
 
 # =========================================================
-# 시작
+# 실행
 # =========================================================
 
 if __name__ == "__main__":
@@ -3806,15 +3534,17 @@ if __name__ == "__main__":
 
         logger.warning(
             "시작 시 DB 초기화 실패",
-            exc_info=True,
+            exc_info=True
         )
+
+    port = int(
+        os.getenv(
+            "PORT",
+            "10000"
+        )
+    )
 
     app.run(
         host="0.0.0.0",
-        port=int(
-            os.getenv(
-                "PORT",
-                "10000",
-            )
-        ),
+        port=port
     )
